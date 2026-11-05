@@ -1,0 +1,34 @@
+[Unit]
+Description=Velocity Proxy - server side Chromium web proxy
+Documentation=file:///opt/velocity-proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=velocity
+Group=velocity
+WorkingDirectory=/opt/velocity-proxy
+EnvironmentFile=/opt/velocity-proxy/.env
+Environment=NODE_ENV=production
+Environment=HOME=/var/lib/velocity-proxy
+Environment=XDG_RUNTIME_DIR=/run/velocity-proxy
+RuntimeDirectory=velocity-proxy
+RuntimeDirectoryMode=0700
+ExecStart=/opt/velocity-proxy/scripts/start-with-audio.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+LimitNOFILE=65535
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/velocity-proxy/data /var/lib/velocity-proxy /run/velocity-proxy
+# Chromium's user-namespace sandbox needs clone/unshare; everything else stays restricted.
+RestrictSUIDSGID=no
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

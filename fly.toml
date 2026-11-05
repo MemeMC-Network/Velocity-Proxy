@@ -1,0 +1,31 @@
+# Fly.io configuration. Create the volume first:
+#   fly volumes create velocity_data --size 2
+app = "velocity-proxy"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  DATA_DIR = "/data"
+  AUDIO_ENABLED = "1"
+  AUDIO_SOURCE = "pulse"
+  AUDIO_DEVICE = "velocity_sink.monitor"
+  AUDIO_PULSE_SINK = "velocity_sink"
+
+[[mounts]]
+  source = "velocity_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 2

@@ -1,0 +1,24 @@
+{
+  "name": "velocity-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Velocity Proxy - a real browser running inside your website, rendered by server-side Chromium. No iframes, no redirects.",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "smoke": "node scripts/smoke-test.mjs",
+    "browser:install": "playwright install chromium"
+  },
+  "dependencies": {
+    "compression": "^1.7.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "playwright": "^1.49.1",
+    "ws": "^8.18.0"
+  }
+}

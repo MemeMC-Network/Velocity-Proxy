@@ -1,0 +1,20 @@
+services:
+  velocity:
+    build: .
+    image: velocity-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      # Set these in a .env file next to this compose file.
+      ACCESS_PASSWORD: ${ACCESS_PASSWORD:-change-me}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
+      FRAME_ANCESTORS: ${FRAME_ANCESTORS:-*}
+      DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - velocity-data:/data
+    shm_size: "1gb"
+
+volumes:
+  velocity-data:

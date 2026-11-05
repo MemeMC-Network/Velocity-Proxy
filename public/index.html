@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#080a0f" />
+    <meta
+      name="description"
+      content="Velocity Proxy - a real browser running inside a website. Server-side Chromium renders every page and streams it to you, so the address bar never leaves this domain."
+    />
+    <title>Velocity Proxy</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%230b0e15'/%3E%3Cpath d='M11 8.2h4.9l-2.6 6.6h4.6L12.4 24.2l1.8-7.1h-4.2z' fill='%2393b4ff'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/css/app.css" />
+    <link rel="stylesheet" href="/css/audio.css" />
+  </head>
+  <body>
+    <div class="app" id="app">
+      <header class="chrome" id="chrome">
+        <div class="tabbar">
+          <div class="tabstrip-scroll">
+            <div class="tabstrip" id="tabs" role="tablist" aria-label="Open tabs"></div>
+          </div>
+          <button class="newtab-btn" id="new-tab" type="button" aria-label="New tab" title="New tab (Ctrl+T)"></button>
+          <div class="tabbar-spacer"></div>
+          <div class="window-actions">
+            <span class="latency" id="latency" data-status="connecting" title="Proxy round trip"><i></i><em>—</em></span>
+            <button class="icon-btn ghost" id="theme-toggle" type="button" aria-label="Toggle theme"></button>
+            <button class="icon-btn ghost" id="settings-btn" type="button" aria-label="Settings" title="Settings"></button>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <div class="nav-actions">
+            <button class="icon-btn" id="back" type="button" aria-label="Back" title="Back (Alt+Left)" disabled></button>
+            <button class="icon-btn" id="forward" type="button" aria-label="Forward" title="Forward (Alt+Right)" disabled></button>
+            <button class="icon-btn" id="reload" type="button" aria-label="Reload" title="Reload"></button>
+            <button class="icon-btn" id="home" type="button" aria-label="Home" title="Home" disabled></button>
+          </div>
+
+          <form class="omnibox" id="omnibox-form" autocomplete="off" novalidate>
+            <div class="omnibox-display" id="omni-display" role="button" tabindex="0" aria-label="Address bar">
+              <span class="omni-lock" id="omni-lock"></span>
+              <span class="omni-fav" id="omni-fav"></span>
+              <span class="omni-title" id="omni-title">New Tab</span>
+              <span class="omni-host" id="omni-host">Search or enter address</span>
+            </div>
+            <input
+              class="omnibox-input"
+              id="omni-input"
+              type="text"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              aria-label="Address and search bar"
+              placeholder="Search or enter an address"
+            />
+            <div class="suggest-panel omni-suggest" id="omni-suggest"></div>
+          </form>
+
+          <div class="toolbar-actions">
+            <button class="icon-btn" id="audio-btn" type="button" aria-label="Audio" title="Audio"></button>
+            <button class="icon-btn" id="bookmark" type="button" aria-label="Bookmark" title="Bookmark this page"></button>
+            <button class="icon-btn" id="copy-url" type="button" aria-label="Copy destination URL" title="Copy destination URL"></button>
+          </div>
+        </div>
+        <div class="progress" id="progress"><span></span></div>
+      </header>
+
+      <main class="viewport" id="viewport">
+        <section class="newtab" id="newtab" aria-label="New tab page">
+          <div class="nt-glow nt-glow-a"></div>
+          <div class="nt-glow nt-glow-b"></div>
+          <div class="nt-grid"></div>
+          <div class="nt-inner">
+            <header class="nt-top">
+              <div class="nt-brand" id="nt-brand"></div>
+              <div class="nt-top-right">
+                <span class="nt-date" id="nt-date"></span>
+                <span class="nt-clock" id="nt-clock"></span>
+              </div>
+            </header>
+
+            <div class="nt-hero">
+              <p class="nt-eyebrow" id="greeting">Good evening</p>
+              <h1 class="nt-headline">Where to next?</h1>
+              <p class="nt-sub">A real Chromium browser runs on the server. You stay right here.</p>
+
+              <form class="nt-search" id="nt-search" autocomplete="off">
+                <button class="engine-chip" id="engine-chip" type="button" aria-label="Choose search engine">
+                  <span class="engine-chip-dot"></span>
+                  <span id="engine-name">Google</span>
+                </button>
+                <input
+                  class="nt-input"
+                  id="nt-input"
+                  type="text"
+                  placeholder="Search Google or enter an address"
+                  aria-label="Search or enter address"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                />
+                <button class="nt-go" type="submit" aria-label="Open"></button>
+                <div class="suggest-panel nt-suggest" id="nt-suggest"></div>
+              </form>
+
+              <div class="nt-trust">
+                <span class="trust-pill"><i class="trust-dot"></i>Session isolated</span>
+                <span class="trust-pill"><i class="trust-dot"></i>No iframes</span>
+                <span class="trust-pill"><i class="trust-dot"></i>SSRF guarded</span>
+              </div>
+            </div>
+
+            <section class="nt-section">
+              <div class="nt-section-head">
+                <h2>Shortcuts</h2>
+              </div>
+              <div class="tiles" id="shortcuts"></div>
+            </section>
+
+            <div class="nt-columns">
+              <section class="nt-section">
+                <div class="nt-section-head"><h2>Recently visited</h2></div>
+                <ul class="site-list" id="recent"></ul>
+              </section>
+              <section class="nt-section">
+                <div class="nt-section-head"><h2>Frequently visited</h2></div>
+                <ul class="site-list" id="frequent"></ul>
+              </section>
+            </div>
+
+            <footer class="nt-footer">
+              <span>Rendered live by server-side Chromium · every request stays on this origin</span>
+              <span class="nt-kbd"><kbd>Ctrl</kbd><kbd>T</kbd> new tab <kbd>Ctrl</kbd><kbd>L</kbd> address bar <kbd>Alt</kbd><kbd>←</kbd> back</span>
+            </footer>
+          </div>
+        </section>
+
+        <div class="viewer" id="viewer">
+          <canvas id="screen" class="screen" tabindex="-1" aria-label="Remote browser surface"></canvas>
+          <textarea
+            id="ime"
+            class="ime"
+            aria-hidden="true"
+            tabindex="-1"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+          ></textarea>
+          <div class="viewer-overlay" id="viewer-overlay" hidden>
+            <div class="vo-card">
+              <div class="vo-spinner" id="vo-spinner" hidden><i></i><i></i><i></i></div>
+              <div class="vo-icon" id="vo-icon" hidden></div>
+              <h2 id="vo-title"></h2>
+              <p id="vo-text"></p>
+              <button class="btn ghost" id="vo-action" type="button" hidden></button>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <div class="settings-backdrop" id="settings-backdrop" hidden></div>
+      <aside class="settings-panel" id="settings-panel" aria-label="Settings" aria-hidden="true">
+        <div class="settings-head">
+          <h2>Settings</h2>
+          <button class="icon-btn" id="settings-close" type="button" aria-label="Close settings">&times;</button>
+        </div>
+
+        <section class="settings-group">
+          <h3>Appearance</h3>
+          <div class="segmented" role="group" aria-label="Theme">
+            <button type="button" data-theme-value="system">System</button>
+            <button type="button" data-theme-value="dark">Dark</button>
+            <button type="button" data-theme-value="light">Light</button>
+          </div>
+          <p class="settings-note">Dark glass by default, tuned for long sessions.</p>
+        </section>
+
+        <section class="settings-group">
+          <h3>Search</h3>
+          <label class="field">
+            <span>Search engine</span>
+            <select id="engine-select"></select>
+          </label>
+          <label class="field" id="custom-template-wrap" hidden>
+            <span>Custom search URL</span>
+            <input id="custom-template" type="text" placeholder="https://example.com/search?q=%s" spellcheck="false" />
+          </label>
+          <p class="settings-note">The query is sent through the proxy to the engine, never from your browser tab.</p>
+        </section>
+
+        <section class="settings-group">
+          <h3>Streaming quality</h3>
+          <label class="field range-field">
+            <span>Quality <em id="quality-label">Balanced · 62%</em></span>
+            <input id="quality-range" type="range" min="30" max="85" step="1" value="62" />
+          </label>
+          <p class="settings-note">Lower quality uses less bandwidth. It adapts automatically on slow links.</p>
+        </section>
+
+        <section class="settings-group">
+          <h3>Audio</h3>
+          <label class="field range-field">
+            <span>Volume <em id="audio-volume-label">80%</em></span>
+            <input id="volume-range" type="range" min="0" max="100" step="1" value="80" />
+          </label>
+          <button class="btn ghost block" id="audio-mute" type="button">Mute audio</button>
+          <p class="settings-note" id="audio-status">Audio starts when you interact with the page.</p>
+        </section>
+
+        <section class="settings-group">
+          <h3>Shortcuts</h3>
+          <button class="btn ghost block" id="reset-shortcuts" type="button">Restore default shortcuts</button>
+        </section>
+
+        <section class="settings-group">
+          <h3>Privacy &amp; session</h3>
+          <button class="btn ghost block" id="clear-history" type="button">Clear browsing history</button>
+          <button class="btn ghost block danger" id="logout" type="button">Sign out</button>
+        </section>
+
+        <section class="settings-group">
+          <h3>Keyboard</h3>
+          <ul class="keymap">
+            <li><kbd>Ctrl</kbd><kbd>T</kbd><span>New tab</span></li>
+            <li><kbd>Ctrl</kbd><kbd>W</kbd><span>Close tab</span></li>
+            <li><kbd>Ctrl</kbd><kbd>L</kbd><span>Address bar</span></li>
+            <li><kbd>Ctrl</kbd><kbd>Tab</kbd><span>Next tab</span></li>
+            <li><kbd>Alt</kbd><kbd>←</kbd><span>Back</span></li>
+            <li><kbd>Ctrl</kbd><kbd>R</kbd><span>Reload</span></li>
+            <li><kbd>Ctrl</kbd><kbd>D</kbd><span>Bookmark</span></li>
+            <li><kbd>Esc</kbd><span>Stop loading</span></li>
+          </ul>
+        </section>
+
+        <footer class="settings-foot">
+          <span><strong>Velocity Proxy</strong> <em id="version-label">v1.0.0</em></span>
+          <span>Chromium rendered · WebSocket streamed</span>
+        </footer>
+      </aside>
+
+      <div class="context-menu" id="context-menu" role="menu"></div>
+      <div class="toasts" id="toasts" aria-live="polite"></div>
+
+      <div class="audio-notice" id="audio-notice" hidden>
+        <span class="audio-notice-dot"></span>
+        <span id="audio-notice-text">Your browser blocked autoplay.</span>
+        <button class="btn primary small" id="audio-enable" type="button">Enable audio</button>
+      </div>
+
+      <div class="modal-layer login-layer" id="login" hidden>
+        <div class="login-aurora"></div>
+        <div class="login-card">
+          <div class="login-brand" id="login-brand"></div>
+          <h1>Sign in</h1>
+          <p class="login-sub">This proxy is private. Enter the access password configured on the server.</p>
+          <form id="login-form" autocomplete="off">
+            <label class="field">
+              <span>Access password</span>
+              <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••" />
+            </label>
+            <p class="login-error" id="login-error" hidden></p>
+            <button class="btn primary block" id="login-submit" type="submit">Continue</button>
+          </form>
+          <p class="login-foot">Signed session cookie · isolated Chromium profile · rate limited</p>
+        </div>
+      </div>
+
+      <div class="modal-layer" id="shortcut-modal" hidden>
+        <div class="modal-card">
+          <h2 id="shortcut-modal-title">Add shortcut</h2>
+          <p class="modal-sub">Shortcuts appear on your new tab page and in search suggestions.</p>
+          <label class="field">
+            <span>Name</span>
+            <input id="shortcut-name" type="text" placeholder="Example" />
+          </label>
+          <label class="field">
+            <span>URL</span>
+            <input id="shortcut-url" type="text" placeholder="https://example.com" spellcheck="false" />
+          </label>
+          <div class="modal-actions">
+            <button class="btn ghost" id="shortcut-cancel" type="button">Cancel</button>
+            <button class="btn primary" id="shortcut-save" type="button">Save</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-layer" id="dialog-modal" hidden>
+        <div class="modal-card">
+          <h2 id="dialog-title">The page says</h2>
+          <p id="dialog-message"></p>
+          <input id="dialog-input" type="text" hidden />
+          <div class="modal-actions">
+            <button class="btn ghost" id="dialog-cancel" type="button">Cancel</button>
+            <button class="btn primary" id="dialog-ok" type="button">OK</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <noscript>
+      <div class="noscript">Velocity Proxy needs JavaScript to stream the remote browser.</div>
+    </noscript>
+
+    <script type="module" src="/js/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,28 @@
+# Render blueprint: https://render.com/docs/blueprint-spec
+# New → Blueprint → point at this repository. Render builds the Dockerfile,
+# mounts a persistent disk for sessions/cookies and terminates TLS for you.
+services:
+  - type: web
+    name: velocity-proxy
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/info
+    envVars:
+      - key: ACCESS_PASSWORD
+        generateValue: true
+      - key: PUBLIC_ORIGIN
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: FRAME_ANCESTORS
+        value: "*"
+      - key: AUDIO_ENABLED
+        value: "1"
+      - key: AUDIO_SOURCE
+        value: pulse
+      - key: AUDIO_DEVICE
+        value: velocity_sink.monitor
+    disk:
+      name: velocity-data
+      mountPath: /data
+      sizeGB: 2

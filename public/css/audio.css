@@ -1,0 +1,118 @@
+/* Audio controls: per-tab mute, global mute/volume and the autoplay notice. */
+
+.tab-audio {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 5px;
+  color: var(--text-dim);
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.tab-audio[hidden] {
+  display: none;
+}
+
+.tab-audio:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+
+.tab-audio.is-audible {
+  color: var(--accent-2, #93b4ff);
+}
+
+.tab-audio.is-muted {
+  color: var(--text-faint);
+}
+
+.tab.is-audible .tab-title {
+  color: var(--text);
+}
+
+.tab-audio.is-audible svg {
+  animation: tabAudioPulse 1.8s ease-in-out infinite;
+}
+
+@keyframes tabAudioPulse {
+  0%,
+  100% {
+    opacity: 0.75;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+#audio-btn {
+  position: relative;
+}
+
+#audio-btn[data-state="live"] {
+  color: #8be0b0;
+}
+
+#audio-btn[data-state="off"],
+#audio-btn.is-muted {
+  color: var(--text-faint);
+}
+
+#audio-btn[data-state="starting"],
+#audio-btn[data-state="reconnecting"] {
+  animation: audioPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes audioPulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.audio-notice {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px 9px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border-strong);
+  background: rgba(10, 14, 22, 0.94);
+  color: var(--text);
+  font-size: 12.5px;
+  box-shadow: 0 24px 60px -28px rgba(0, 0, 0, 0.9);
+  backdrop-filter: blur(14px);
+  transform: translateX(-50%);
+}
+
+.audio-notice[hidden] {
+  display: none;
+}
+
+.audio-notice-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ffcf6b;
+  box-shadow: 0 0 10px rgba(255, 207, 107, 0.7);
+  flex: none;
+}
+
+.btn.small {
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12px;
+  border-radius: 8px;
+}
+
+.audio-notice .btn.small {
+  flex: none;
+}
