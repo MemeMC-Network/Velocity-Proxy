@@ -217,7 +217,7 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `BROWSER_IDLE_SECONDS` | `180` | A session with no connected visitor loses its Chromium process, audio sink and ffmpeg after this long; tabs reload on reconnect. |
 | `MAX_LIVE_BROWSERS` | `6` | Cap on concurrent Chromium processes. Only sessions with no connected visitor are evicted, least recently active first. |
 | `MAX_LIVE_TABS` | `16` | Cap on live pages across all sessions; the least recently used tab without viewers is suspended. |
-| `SCREENCAST_FPS` | `30` | Maximum frames pushed to viewers per second; extra captures are dropped before packetising. |
+| `SCREENCAST_FPS` | `30` | Maximum frames pushed to viewers per second. Chromium skips the intermediate frames in the compositor, so they are never JPEG-encoded (at 30 fps this measured ~28% less browser CPU than encoding every frame), and the client drops anything still over the cap. |
 | `IDLE_POLL_MS` | `5000` | Page polling interval for tabs nobody is watching; `1100` while watched. |
 | `CHROMIUM_JS_HEAP_MB` | `512` | V8 old-space cap per renderer, so one heavy page cannot grow without bound. `0` keeps Chromium's default. |
 | `NAV_TIMEOUT_MS` | `45000` | Navigation timeout. |
@@ -240,6 +240,10 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `SSRF_GUARD` | `routes` | `routes` inspects every request; `nav` only top-level navigations. |
 | `ALLOW_PRIVATE_TARGETS` | `0` | Development only: allow loopback/private destinations. |
 | `RATE_LIMIT_PER_MINUTE` | `240` | Per-IP budget for HTTP APIs and WebSocket upgrades. |
+| `CONTENT_FILTER` | `1` | Block adult domains and explicit search terms, and force safe search on the built-in engines. |
+| `CONTENT_FILTER_BLOCK` | – | Extra blocked hosts, comma separated, suffix matched (`foo.com` also blocks `www.foo.com`). |
+| `CONTENT_FILTER_ALLOW` | – | Hosts the filter must never block; wins over the built-in list and `CONTENT_FILTER_BLOCK`. |
+| `CONTENT_FILTER_TERMS` | – | Extra blocked search terms (whole words), added to the built-in list. |
 | `DATA_DIR` | `.data` | Sessions, tab metadata, secrets, favicon cache. |
 | `LOG_LEVEL` | `info` | `debug` logs tab lifecycle and page errors. |
 
@@ -300,11 +304,59 @@ journalctl -u velocity-proxy -f
   resolution, with a short-lived DNS cache. In `routes` mode every request of every context, plus
   WebSocket handshakes, is re-validated, so redirects and subresources cannot reach internal
   services either.
+- **Content filter.** With `CONTENT_FILTER=1` (default) a target is refused when its host is on the
+  built-in adult list or `CONTENT_FILTER_BLOCK`, or when a search query (or a query in a search
+  engine URL) contains an explicit term; `CONTENT_FILTER_ALLOW` exempts hosts. The check runs when
+  the address bar resolves a target, on every main-frame navigation, and in the same request route
+  that enforces SSRF (`SSRF_GUARD=routes`, the default), so links, redirects, popups, WebSockets and
+  embedded resources cannot load a blocked host either. A blocked navigation blanks the page and shows the tab's error overlay
+  instead of rendering the content, and it is never added to history. Built-in engines append
+  safe-search flags (`safe=active`, `adlt=strict`, `kp=1`, `safesearch=strict`) and YouTube gets its
+  restricted-mode cookie.
+
+## Cloud gaming (GeForce NOW and similar WebRTC apps)
+
+`play.geforcenow.com` now renders through the proxy and reaches its sign-in screen. Two things were
+in the way:
+
+- The remote browser advertised `HeadlessChrome` in its UA string and Client Hints. Every context now
+  presents a desktop Chrome identity (UA, `navigator.userAgentData` brands and high-entropy values
+  agree); `USER_AGENT` still overrides the string if you need a different platform.
+- The stealth script replaced `navigator.plugins` with `[1,2,3,4,5]`, and the GeForce NOW client
+  threw `Cannot read properties of undefined (reading 'implementationType')` and left the app root
+  empty. It now exposes plugin objects with `name`/`description`/`filename`, the shape real Chrome
+  uses, so the SPA boots.
+
+GeForce NOW can still print "You're not using a recommended browser". On this machine that notice
+survives with the UA, Client Hints, plugins and `navigator.webdriver` each masked, so it is not
+headless detection; the remaining difference is that the server renders with SwiftShader (no GPU).
+It is a warning, not a block, but software H.264 decode is CPU-hungry, so a host with a GPU is the
+right place for gaming sessions. The bundled Chromium already decodes H.264/AAC and offers H.264 in
+WebRTC, so no extra browser build is required.
+
+For a smoother session:
+
+```
+SCREENCAST_FPS=60      # frame rate of the JPEG stream; costs CPU per frame
+FRAME_QUALITY=70       # sharper starting point before adaptation
+```
+
+The quality slider in Settings (or the palette's quality commands) now locks the value: before, a
+manual choice was pulled back down by the adaptive downscaler within a few seconds. A locked value
+stays put for that tab, and fullscreen plus pointer capture work through the existing canvas.
+
+What it cannot fix: the game video is decoded by the server's Chromium and re-encoded as JPEG, so
+there is one extra encode hop and frame granularity of 1/`SCREENCAST_FPS` on top of the NVIDIA round
+trip - fine on a nearby data centre, not equal to the native client. Gamepads are not bridged (the
+Gamepad API reads devices attached to the server, and none are), so pick titles that accept
+keyboard and mouse, and DRM/Widevine content stays unavailable. Starting a real game needs an NVIDIA
+account, so a live streaming session was not exercised here; the page, browser check and login flow
+were.
 
 ## Verification
 
 `npm run smoke` boots the real server with a throwaway data dir, a local target site and
-`AUDIO_SOURCE=tone`, then drives the HTTP + WebSocket protocol end to end. It covers 32 assertions:
+`AUDIO_SOURCE=tone`, then drives the HTTP + WebSocket protocol end to end. It covers 37 assertions:
 unauthenticated API/WS refusal, the `SameSite=None; Secure` login cookie, root SPA route,
 `frame-ancestors *` / no `X-Frame-Options` / `autoplay=*` (iframe embedding), legacy tab-path
 redirects, favicon
@@ -315,8 +367,10 @@ stream (ffmpeg → socket → EBML header), a separate capture for each session,
 unauthenticated audio sockets, a screencast that stops receiving frames while the viewer reports it
 is hidden and resumes on return, the auth-guarded `/api/stats` snapshot, cross-origin refusal on
 `/api/reclaim`, the absence of
-iframes/`window.open`/`history.pushState` in the client sources, SSRF unit checks and URL detection.
-The suite passed 32/32 on this machine (Chromium 156 headless, Node 22, ffmpeg 8.0.1).
+iframes/`window.open`/`history.pushState` in the client sources, SSRF unit checks, URL detection,
+the content filter (blocked domain, explicit query, blocked in-page link), and a fingerprint check
+that the remote browser does not present itself as headless.
+The suite passed 37/37 on this machine (Chromium 156 headless, Node 22, ffmpeg 8.0.1).
 
 Manual checks against the live UI (same build):
 
@@ -359,12 +413,19 @@ should be exercised on a throwaway VPS before production.
   show consent or login walls. That is the site's bot policy, not a proxy failure.
 - **Headless fingerprinting.** Some sites behave differently for headless Chromium; a few may block
   automated browsers outright.
+- **The content filter is a blocklist, not a classifier.** It stops the listed adult hosts and
+  obvious search terms and turns on safe search, but a page served from a host outside the list, or
+  a site's own internal search box, is not judged. Add hosts with `CONTENT_FILTER_BLOCK`.
 - **No browser extensions, DevTools, passkeys/WebAuthn, or native print dialogs.**
 - Tabs are per user and capped (`MAX_TABS`, `MAX_SESSIONS`); heavy video tabs cost real CPU/RAM.
 - Idle work is capped too: `MAX_LIVE_BROWSERS` / `MAX_LIVE_TABS` bound how many Chromium
   processes and pages exist at once, `BROWSER_IDLE_SECONDS` frees a disconnected session's browser,
-  `SCREENCAST_FPS` limits frame encoding, and unwatched tabs are polled every `IDLE_POLL_MS`
-  instead of every 1.1 s.
+  `SCREENCAST_FPS` limits frame encoding — frames above the cap are skipped in the compositor, so
+  they are never encoded at all — and unwatched tabs are polled every `IDLE_POLL_MS` instead of
+  every 1.1 s. Favicon refreshes are throttled to once per host per minute.
+- The UI redraws only the tab bar and home tiles it must: chrome, tiles and cards are plain CSS
+  with no backdrop blur or continuously animating decoration, so sitting on the home page costs
+  nothing until you type.
 - The UI ships as ES modules without a build step; a hard refresh may be needed after upgrading a
   running instance (assets are served `Cache-Control: no-cache` and revalidate by ETag).
 
@@ -377,6 +438,7 @@ src/
   auth.js                HMAC session tokens, cookies, same-origin checks
   search.js              engines, URL/query detection, suggestions proxy
   security/ip-guard.js   SSRF validation + DNS cache
+  security/content-filter.js  adult domain blocklist + explicit search terms
   security/rate-limit.js per-IP limiter
   browser/workspaces.js  Chromium launch, contexts, tab records, persistence
   browser/tab.js         TabSession: screencast, navigation, input, dialogs
@@ -391,7 +453,7 @@ deploy/
   nginx-velocity.conf, velocity-proxy.service
 scripts/
   start-with-audio.sh    PulseAudio null sink + service entrypoint
-  smoke-test.mjs         27-check end-to-end suite
+  smoke-test.mjs         37-check end-to-end suite
 install.sh · uninstall.sh · update.sh · start.sh
 ```
 

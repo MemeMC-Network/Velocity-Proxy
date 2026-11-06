@@ -2,11 +2,12 @@ import crypto from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import { AuthService } from '../auth.js';
 import { config } from '../config.js';
-import { HttpError } from '../errors.js';
+import { HttpError, blocked } from '../errors.js';
 import { log } from '../logger.js';
 import { clientIp } from '../security/rate-limit.js';
 import { assertPublicHttpUrl } from '../security/ip-guard.js';
-import { normalizeTarget, validateTemplate } from '../search.js';
+import { looksLikeUrl, normalizeTarget, validateTemplate } from '../search.js';
+import { blockedQueryReason, blockedUrlReason } from '../security/content-filter.js';
 import { clamp } from '../util.js';
 
 const reject = (socket, status, message) => {
@@ -43,6 +44,9 @@ const resolveInput = async (message) => {
     throw new HttpError(400, error.message || 'That URL is not valid');
   }
   if (!target) throw new HttpError(400, 'Type a URL or a search query');
+  const filterReason =
+    (looksLikeUrl(input) ? null : blockedQueryReason(input)) || blockedUrlReason(target);
+  if (filterReason) throw blocked(filterReason);
   await assertPublicHttpUrl(target);
   return target;
 };

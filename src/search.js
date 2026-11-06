@@ -1,27 +1,33 @@
+import { config } from './config.js';
 import { log } from './logger.js';
+import { blockedQueryReason } from './security/content-filter.js';
 
 export const ENGINES = {
   google: {
     name: 'Google',
     search: 'https://www.google.com/search?q=%s',
+    safeSearch: '&safe=active',
     suggest: 'https://suggestqueries.google.com/complete/search?client=firefox&hl=en&q=%s',
     parseSuggest: (data) => (Array.isArray(data) ? data[1] : []),
   },
   duckduckgo: {
     name: 'DuckDuckGo',
     search: 'https://duckduckgo.com/?q=%s',
+    safeSearch: '&kp=1',
     suggest: 'https://duckduckgo.com/ac/?type=list&q=%s',
     parseSuggest: (data) => (Array.isArray(data) ? data.map((item) => item?.phrase).filter(Boolean) : []),
   },
   bing: {
     name: 'Bing',
     search: 'https://www.bing.com/search?q=%s',
+    safeSearch: '&adlt=strict',
     suggest: 'https://api.bing.com/osjson.aspx?query=%s',
     parseSuggest: (data) => (Array.isArray(data) ? data[1] : []),
   },
   brave: {
     name: 'Brave',
     search: 'https://search.brave.com/search?q=%s',
+    safeSearch: '&safesearch=strict',
     suggest: 'https://search.brave.com/api/suggest?q=%s&source=web',
     parseSuggest: (data) => (Array.isArray(data?.results) ? data.results : Array.isArray(data?.[1]) ? data[1] : []),
   },
@@ -73,7 +79,10 @@ const searchUrl = (query, { engine, template }) => {
     return template.replace('%s', encodeURIComponent(query));
   }
   const definition = ENGINES[engine] || ENGINES.google;
-  return definition.search.replace('%s', encodeURIComponent(query));
+  const url = definition.search.replace('%s', encodeURIComponent(query));
+  // Safe search flags keep explicit results off the results page; the domain
+  // blocklist still refuses the sites if someone follows a result link.
+  return config.contentFilter && definition.safeSearch ? `${url}${definition.safeSearch}` : url;
 };
 
 export const validateTemplate = (template) => {
@@ -97,6 +106,7 @@ const suggestCache = new Map();
 export const getSuggestions = async (query, engine = 'google') => {
   const q = String(query ?? '').trim().slice(0, 200);
   if (!q) return [];
+  if (blockedQueryReason(q)) return [];
   const definition = ENGINES[engine];
   if (!definition?.suggest) return [];
   const key = `${engine}:${q.toLowerCase()}`;
@@ -119,7 +129,7 @@ export const getSuggestions = async (query, engine = 'google') => {
     const items = (definition.parseSuggest(data) || [])
       .filter((item) => typeof item === 'string')
       .map((item) => item.trim())
-      .filter((item) => item && item.toLowerCase() !== q.toLowerCase())
+      .filter((item) => item && item.toLowerCase() !== q.toLowerCase() && !blockedQueryReason(item))
       .slice(0, 8);
     if (suggestCache.size > 500) suggestCache.clear();
     suggestCache.set(key, { items, expiresAt: Date.now() + 60_000 });

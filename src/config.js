@@ -20,6 +20,16 @@ const boolean = (value, fallback = false) => {
   return /^(1|true|yes|on)$/i.test(String(value));
 };
 
+// Comma or whitespace separated list, lowercased and de-duplicated.
+const list = (value) => [
+  ...new Set(
+    String(value ?? '')
+      .split(/[\s,]+/)
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean),
+  ),
+];
+
 const dataDir = path.resolve(rootDir, text(process.env.DATA_DIR, '.data'));
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(path.join(dataDir, 'workspaces'), { recursive: true });
@@ -122,6 +132,13 @@ export const config = Object.freeze({
   ssrfGuard: text(process.env.SSRF_GUARD, 'routes').toLowerCase() === 'nav' ? 'nav' : 'routes',
   allowPrivateTargets: boolean(process.env.ALLOW_PRIVATE_TARGETS, false),
   rateLimitPerMinute: integer(process.env.RATE_LIMIT_PER_MINUTE, 240, 20, 10000),
+
+  // Content filter: blocks adult domains and explicit search terms, and turns
+  // on safe search for the built-in engines.
+  contentFilter: boolean(process.env.CONTENT_FILTER, true),
+  contentFilterBlock: list(process.env.CONTENT_FILTER_BLOCK),
+  contentFilterAllow: list(process.env.CONTENT_FILTER_ALLOW),
+  contentFilterTerms: list(process.env.CONTENT_FILTER_TERMS),
 
   logLevel: text(process.env.LOG_LEVEL, 'info').toLowerCase(),
   isRoot: typeof process.getuid === 'function' && process.getuid() === 0,

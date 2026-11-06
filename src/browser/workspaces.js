@@ -6,14 +6,73 @@ import { FaviconCache } from './favicon.js';
 import { HttpError } from '../errors.js';
 import { log } from '../logger.js';
 import { assertPublicHttpUrl, isBlockedUrl } from '../security/ip-guard.js';
+import { blockedUrlReason } from '../security/content-filter.js';
 import { hostOf, randomId, shortHash } from '../util.js';
 
-const STEALTH_SCRIPT = `
+const PLATFORM =
+  process.platform === 'win32'
+    ? { uaToken: 'Windows NT 10.0; Win64; x64', name: 'Windows', version: '10.0.0' }
+    : process.platform === 'darwin'
+      ? { uaToken: 'Macintosh; Intel Mac OS X 10_15_7', name: 'macOS', version: '10.15.7' }
+      : { uaToken: 'X11; Linux x86_64', name: 'Linux', version: '6.5.0' };
+
+/**
+ * Chromium keeps "HeadlessChrome" in its Client Hints even when the UA string is
+ * rewritten, and sites such as GeForce NOW read either one as an unsupported
+ * browser. Present a consistent desktop Chrome identity instead.
+ */
+const buildStealthScript = ({ version, major }) => `
 Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined });
 if (!window.chrome) { Object.defineProperty(window, 'chrome', { value: { runtime: {} }, writable: true }); }
 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+// Plugin objects, not bare numbers: apps read .name/.filename and crash on
+// undefined.startsWith() when the entries are not shaped like the real thing.
 try {
-  Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+  const plugin = (name) => ({
+    name,
+    description: 'Portable Document Format',
+    filename: 'internal-pdf-viewer',
+    length: 0,
+  });
+  Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+      plugin('PDF Viewer'),
+      plugin('Chrome PDF Viewer'),
+      plugin('Chromium PDF Viewer'),
+      plugin('Microsoft Edge PDF Viewer'),
+      plugin('WebKit built-in PDF'),
+    ],
+  });
+} catch (error) {}
+try {
+  const brands = [
+    { brand: 'Google Chrome', version: '${major}' },
+    { brand: 'Chromium', version: '${major}' },
+    { brand: 'Not A(Brand', version: '8' },
+  ];
+  const fullVersionList = [
+    { brand: 'Google Chrome', version: '${version}' },
+    { brand: 'Chromium', version: '${version}' },
+  ];
+  const data = {
+    brands,
+    fullVersionList,
+    mobile: false,
+    platform: '${PLATFORM.name}',
+    getHighEntropyValues: async () => ({
+      brands,
+      fullVersionList,
+      mobile: false,
+      platform: '${PLATFORM.name}',
+      platformVersion: '${PLATFORM.version}',
+      architecture: 'x86',
+      bitness: '64',
+      model: '',
+      uaFullVersion: '${version}',
+      wow64: false,
+    }),
+  };
+  Object.defineProperty(Navigator.prototype, 'userAgentData', { get: () => data, configurable: true });
 } catch (error) {}
 `;
 
@@ -224,9 +283,20 @@ export class WorkspaceManager {
     }
   }
 
+  /** A normal desktop Chrome identity for a launched browser (USER_AGENT wins). */
+  fingerprintFor(browser) {
+    const version = browser?.version() || '120.0.0.0';
+    const major = version.split('.')[0] || '120';
+    const userAgent =
+      this.config.userAgent ||
+      `Mozilla/5.0 (${PLATFORM.uaToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
+    return { userAgent, version, major };
+  }
+
   async createContext(workspace, { storageState } = {}) {
     const browser = await this.ensureBrowser(workspace);
     const viewport = { width: 1280, height: 800 };
+    const fingerprint = this.fingerprintFor(browser);
     const context = await browser.newContext({
       viewport,
       screen: viewport,
@@ -236,19 +306,42 @@ export class WorkspaceManager {
       acceptDownloads: false,
       ignoreHTTPSErrors: false,
       serviceWorkers: 'allow',
-      userAgent: this.config.userAgent || undefined,
+      userAgent: fingerprint.userAgent,
       storageState: storageState || undefined,
     });
     context.setDefaultTimeout(20_000);
     context.setDefaultNavigationTimeout(this.config.navTimeoutMs);
     this.contextOwners.set(context, workspace);
-    await context.addInitScript(STEALTH_SCRIPT).catch(() => {});
-    await context.grantPermissions([]).catch(() => {});
+    await context.addInitScript(buildStealthScript(fingerprint)).catch(() => {});
+    // What a full-screen web app asks for: clipboard access ("copy the invite
+    // link") and a screen wake lock. Neither reaches the host machine.
+    await context
+      .grantPermissions(['clipboard-read', 'clipboard-write', 'screen-wake-lock', 'storage-access'])
+      .catch(() => context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {}));
 
+    // Safe search survives navigation: YouTube's restricted mode and
+    // DuckDuckGo's strict filter are cookie driven, unlike the URL flags.
+    if (this.config.contentFilter) {
+      await context
+        .addCookies([
+          { name: 'PREF', value: 'f2=8000000', domain: '.youtube.com', path: '/', secure: true, httpOnly: false },
+          { name: 'kp', value: '1', domain: 'duckduckgo.com', path: '/', secure: true, httpOnly: false },
+        ])
+        .catch(() => {});
+    }
+
+    // The content filter rides on the SSRF route: in `routes` mode every request
+    // is already intercepted, so blocking a host here costs no extra work and
+    // catches links, redirects, popups and embedded resources alike.
     if (this.config.ssrfGuard === 'routes') {
       await context.route('**/*', async (route) => {
+        const requestUrl = route.request().url();
+        if (blockedUrlReason(requestUrl)) {
+          await route.abort('blockedbyclient');
+          return;
+        }
         try {
-          if (await isBlockedUrl(route.request().url())) {
+          if (await isBlockedUrl(requestUrl)) {
             await route.abort('blockedbyclient');
             return;
           }
@@ -262,7 +355,7 @@ export class WorkspaceManager {
     try {
       await context.routeWebSocket('**/*', async (ws) => {
         try {
-          if (await isBlockedUrl(ws.url())) {
+          if (blockedUrlReason(ws.url()) || (await isBlockedUrl(ws.url()))) {
             await ws.close({ code: 1008, reason: 'Blocked by proxy policy' });
             return;
           }

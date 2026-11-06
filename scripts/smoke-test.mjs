@@ -99,12 +99,32 @@ const siteServer = http.createServer((req, res) => {
     );
     return;
   }
+  if (pathname === '/fingerprint') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(
+      page(
+        'Fingerprint',
+        '<script>const b=(navigator.userAgentData?.brands||[]).map((x)=>x.brand).join(",");document.title=[navigator.userAgent,navigator.webdriver,b,typeof navigator.plugins[0]?.name].join("|")</script>',
+      ),
+    );
+    return;
+  }
   if (pathname === '/motion') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end(
       page(
         'Motion Page',
         '<h1>motion</h1><script>let n=0;setInterval(()=>{document.body.style.background=n++%2?"#12161f":"#1d2430"},120)</script>',
+      ),
+    );
+    return;
+  }
+  if (pathname === '/link') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(
+      page(
+        'Link Page',
+        '<a href="https://www.pornhub.com/" style="position:fixed;left:0;top:0;width:400px;height:150px;display:block">blocked link</a>',
       ),
     );
     return;
@@ -369,6 +389,21 @@ try {
     await forward;
   });
 
+  await check('the remote browser does not present itself as headless', async () => {
+    const loaded = nextMessage(
+      'tab',
+      (entry) => entry.tab.id === tabId && /Chrome\//.test(entry.tab.title || ''),
+    );
+    ws.send(JSON.stringify({ t: 'nav', tabId, input: `${siteUrl}fingerprint` }));
+    const message = await loaded;
+    const title = message.tab.title;
+    assert.doesNotMatch(title, /headless/i);
+    assert.match(title, /Google Chrome/);
+    assert.doesNotMatch(title, /\|true\|/); // navigator.webdriver is hidden
+    // Plugin entries must be objects: a list of numbers crashes real apps.
+    assert.match(title, /\|string$/);
+  });
+
   await check('a bare query is expanded with the search engine template', async () => {
     const promise = nextMessage(
       'tab',
@@ -383,6 +418,41 @@ try {
       }),
     );
     await promise;
+  });
+
+  await check('the content filter refuses an explicit search query', async () => {
+    const promise = nextMessage('error');
+    ws.send(JSON.stringify({ t: 'nav', tabId, input: 'explicit porn videos' }));
+    const message = await promise;
+    assert.match(message.message, /content filter/i);
+  });
+
+  await check('the content filter refuses a blocked destination', async () => {
+    const promise = nextMessage('error');
+    ws.send(JSON.stringify({ t: 'nav', tabId, input: 'https://www.pornhub.com/' }));
+    const message = await promise;
+    assert.match(message.message, /blocked|content filter/i);
+  });
+
+  await check('a link to a blocked host is refused inside the page', async () => {
+    const loaded = nextMessage(
+      'tab',
+      (entry) => entry.tab.id === tabId && entry.tab.title === 'Link Page',
+    );
+    ws.send(JSON.stringify({ t: 'nav', tabId, input: `${siteUrl}link` }));
+    await loaded;
+
+    const blocked = nextMessage(
+      'tab',
+      (entry) =>
+        entry.tab.id === tabId && entry.tab.status === 'error' && /content filter/i.test(entry.tab.error || ''),
+      30_000,
+    );
+    ws.send(JSON.stringify({ t: 'mouse', tabId, type: 'move', x: 60, y: 40 }));
+    ws.send(JSON.stringify({ t: 'mouse', tabId, type: 'down', x: 60, y: 40, button: 'left', clickCount: 1 }));
+    ws.send(JSON.stringify({ t: 'mouse', tabId, type: 'up', x: 60, y: 40, button: 'left', clickCount: 1 }));
+    const message = await blocked;
+    assert.match(message.tab.host, /pornhub\.com/);
   });
 
   await check('keystrokes and inserted text reach the remote page', async () => {
@@ -676,13 +746,29 @@ try {
     assert.equal(search.normalizeTarget('https://example.com/a?b=1'), 'https://example.com/a?b=1');
     assert.equal(
       search.normalizeTarget('how to bake bread'),
-      'https://www.google.com/search?q=how%20to%20bake%20bread',
+      'https://www.google.com/search?q=how%20to%20bake%20bread&safe=active',
     );
-    assert.equal(search.normalizeTarget('bread', { engine: 'duckduckgo' }), 'https://duckduckgo.com/?q=bread');
+    assert.equal(
+      search.normalizeTarget('bread', { engine: 'duckduckgo' }),
+      'https://duckduckgo.com/?q=bread&kp=1',
+    );
     assert.match(
       search.normalizeTarget('cats', { template: 'https://search.example/?q=%s' }),
       /search\.example\/\?q=cats/,
     );
+  });
+
+  await check('content filter blocks adult domains and explicit searches', async () => {
+    const filter = await import('../src/security/content-filter.js');
+    assert.equal(filter.isBlockedHost('www.pornhub.com'), true);
+    assert.equal(filter.isBlockedHost('pornhub.com'), true);
+    assert.equal(filter.isBlockedHost('example.com'), false);
+    assert.match(filter.blockedUrlReason('https://www.xvideos.com/'), /content filter/i);
+    assert.match(filter.blockedUrlReason('https://www.google.com/search?q=porn'), /blocked/i);
+    assert.equal(filter.blockedUrlReason('https://example.com/pornography'), null);
+    assert.match(filter.blockedQueryReason('nude pics'), /blocked/i);
+    assert.equal(filter.blockedQueryReason('how to bake bread'), null);
+    assert.ok(filter.blockedDomains().length > 50);
   });
 
   console.log(`\n${results.filter((entry) => entry.ok).length}/${results.length} checks passed\n`);

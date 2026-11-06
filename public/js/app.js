@@ -1100,6 +1100,7 @@ const renderAudio = () => {
   if (els.audioNotice) {
     const show = snap.blocked && snap.started;
     els.audioNotice.hidden = !show;
+    document.body.classList.toggle('has-audio-notice', show);
     if (show && els.audioNoticeText) {
       els.audioNoticeText.textContent = 'Your browser blocked autoplay. Enable audio to hear this page.';
     }
