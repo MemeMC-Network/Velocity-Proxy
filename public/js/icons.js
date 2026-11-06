@@ -30,6 +30,9 @@ const PATHS = {
   keyboard: '<rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M6 13h.01M9.5 13h.01M13 13h.01M16.5 13h.01M7.5 16h9"/>',
   monitor: '<rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>',
   bolt: '<path d="M13 2 4.5 13.5H11l-1 8.5L19.5 10H13z"/>',
+  activity: '<path d="M3 12h3.6l2.4-6.2 3.6 12.4 2.4-6.2H21"/>',
+  camera: '<path d="M4 8.5h3.2l1.5-2.2h6.6l1.5 2.2H20V19H4z"/><circle cx="12" cy="13.4" r="3.2"/>',
+  expand: '<path d="M4 9V4h5M20 15v5h-5M20 9V4h-5M4 15v5h5"/>',
   volume: '<path d="M11 5 6.5 9H3v6h3.5L11 19z"/><path d="M15 8.5a5 5 0 0 1 0 7"/><path d="M17.7 6a8.5 8.5 0 0 1 0 12"/>',
   volumeX: '<path d="M11 5 6.5 9H3v6h3.5L11 19z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/>',
 };
@@ -40,16 +43,10 @@ export const icon = (name, size = 18, extraClass = '') =>
 export const starIcon = (filled, size = 18) =>
   `<svg class="icon star-icon ${filled ? 'is-filled' : ''}" viewBox="0 0 24 24" width="${size}" height="${size}" fill="${filled ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${PATHS.star}</svg>`;
 
-export const brandMark = (size = 26, gradientId = 'velocity-brand-gradient') => `
-<svg class="brand-mark" viewBox="0 0 32 32" width="${size}" height="${size}" aria-hidden="true" focusable="false">
-  <defs>
-    <linearGradient id="${gradientId}" x1="4" y1="2" x2="28" y2="30" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#9fd0ff"/><stop offset="0.55" stop-color="#7d9dff"/><stop offset="1" stop-color="#b48cff"/>
-    </linearGradient>
-  </defs>
-  <rect x="1.2" y="1.2" width="29.6" height="29.6" rx="9" fill="url(#${gradientId})" opacity="0.16"/>
-  <rect x="1.55" y="1.55" width="28.9" height="28.9" rx="8.7" fill="none" stroke="url(#${gradientId})" stroke-opacity="0.5"/>
-  <path d="M11 8.2h4.9l-2.6 6.6h4.6L12.4 24.2l1.8-7.1h-4.2z" fill="url(#${gradientId})"/>
+export const brandMark = (size = 26) => `
+<svg class="brand-mark" viewBox="0 0 32 32" width="${size}" height="${size}" fill="none" aria-hidden="true" focusable="false">
+  <rect x="0.75" y="0.75" width="30.5" height="30.5" rx="9" stroke="currentColor" stroke-opacity="0.22"/>
+  <path d="M10.6 9.8h3.3l4.1 10.4 4.1-10.4h1.7l-5 13.2h-3.6z" fill="currentColor"/>
 </svg>`;
 
 export const monogram = (label, seed, size = 18) => {

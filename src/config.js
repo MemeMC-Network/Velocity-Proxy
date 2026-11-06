@@ -39,6 +39,8 @@ const readOrCreateSecret = (fileName, bytes = 32) => {
   return secret;
 };
 
+const sessionLimit = integer(process.env.MAX_SESSIONS, 40, 1, 500);
+
 const authMode = text(process.env.AUTH_MODE, 'password').toLowerCase() === 'none' ? 'none' : 'password';
 const allowNoAuth = boolean(process.env.ALLOW_NO_AUTH, false);
 
@@ -68,8 +70,22 @@ export const config = Object.freeze({
   sessionTtlMs: integer(process.env.SESSION_TTL_DAYS, 30, 1, 365) * 24 * 60 * 60 * 1000,
 
   maxTabs: integer(process.env.MAX_TABS, 12, 1, 40),
-  maxSessions: integer(process.env.MAX_SESSIONS, 40, 1, 500),
+  maxSessions: sessionLimit,
   tabIdleMs: integer(process.env.TAB_IDLE_MINUTES, 10, 1, 720) * 60 * 1000,
+  // Nothing is watching a closed tab's browser, so free it much sooner than a
+  // tab's page: this is where most of the RAM goes.
+  browserIdleMs: integer(process.env.BROWSER_IDLE_SECONDS, 180, 15, 3600) * 1000,
+  // Concurrent Chromium processes are capped; only idle sessions are evicted.
+  maxLiveBrowsers: integer(process.env.MAX_LIVE_BROWSERS, Math.max(2, Math.min(6, sessionLimit)), 1, 32),
+  maxLiveTabs: integer(
+    process.env.MAX_LIVE_TABS,
+    Math.max(4, Math.min(16, sessionLimit)),
+    1,
+    64,
+  ),
+  // Screencast frame rate and the poll cadence used while nobody is watching.
+  screencastFps: integer(process.env.SCREENCAST_FPS, 30, 5, 60),
+  idlePollMs: integer(process.env.IDLE_POLL_MS, 5000, 1000, 60000),
   navTimeoutMs: integer(process.env.NAV_TIMEOUT_MS, 45000, 5000, 180000),
   frameQuality: integer(process.env.FRAME_QUALITY, 62, 20, 90),
   viewportMaxWidth: integer(process.env.VIEWPORT_MAX_WIDTH, 1920, 640, 2560),
@@ -82,11 +98,18 @@ export const config = Object.freeze({
   audioBitrateKbps: integer(process.env.AUDIO_BITRATE_KBPS, 64, 24, 160),
   audioPulseServer: text(process.env.AUDIO_PULSE_SERVER),
   audioPulseSink: text(process.env.AUDIO_PULSE_SINK),
+  // Give every signed-in session its own Chromium process and audio sink, so a
+  // visitor never hears another visitor's tabs. Costs one browser per session.
+  audioPerSession: boolean(process.env.AUDIO_PER_SESSION, true),
+  audioPactlPath: text(process.env.AUDIO_PACTL_PATH, 'pactl'),
 
   chromiumPath: text(process.env.CHROMIUM_PATH),
   browserMode: text(process.env.BROWSER_MODE, 'headless').toLowerCase() === 'headed' ? 'headed' : 'headless',
   chromiumSandbox: text(process.env.CHROMIUM_SANDBOX, 'auto').toLowerCase(),
   chromiumArgs: text(process.env.CHROMIUM_ARGS).split(/\s+/).filter(Boolean),
+  // Caps each renderer's V8 old space so one heavy page cannot grow without
+  // bound. 0 leaves Chromium's default in place.
+  chromiumJsHeapMb: integer(process.env.CHROMIUM_JS_HEAP_MB, 512, 0, 4096),
   userAgent: text(process.env.USER_AGENT),
 
   // CSP frame-ancestors. "*" allows embedding on any site; "'none'" (or "none")

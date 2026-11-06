@@ -38,6 +38,7 @@ const defaults = {
   quality: 62,
   volume: 0.8,
   muted: false,
+  zoom: 1,
 };
 
 export const state = {

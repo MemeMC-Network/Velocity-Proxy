@@ -22,6 +22,7 @@ import {
   clearViewport,
   ensureSizePublished,
   forwardKey,
+  getZoom,
   hideOverlay,
   initViewport,
   isEditableTarget,
@@ -29,11 +30,15 @@ import {
   requestedSize,
   requestCopy,
   setActiveTab,
+  setZoom,
   showError,
   showLoading,
+  toggleFullscreen,
 } from './viewport.js';
 import { focusHomeSearch, initHome, refreshHome, updatePlaceholder } from './home.js';
 import { applyThemePreference, closeSettings, initSettings, openSettings, refreshSettings, setTheme } from './settings.js';
+import { closePalette, initPalette, openPalette } from './palette.js';
+import { initSystem, openSystem } from './system.js';
 
 const els = {};
 const tabNodes = new Map();
@@ -57,7 +62,7 @@ const cacheElements = () => {
     'settings-panel', 'settings-backdrop', 'settings-close', 'engine-select', 'custom-template-wrap',
     'custom-template', 'quality-range', 'quality-label', 'clear-history', 'reset-shortcuts', 'logout',
     'version-label', 'context-menu', 'toasts',
-    'audio-btn', 'audio-notice', 'audio-notice-text', 'audio-enable', 'audio-status', 'volume-range', 'audio-mute',
+    'activity-btn', 'fullscreen-btn', 'audio-btn', 'audio-notice', 'audio-notice-text', 'audio-enable', 'audio-status', 'volume-range', 'audio-mute',
     'login', 'login-form', 'login-password', 'login-error', 'login-submit', 'login-brand',
     'shortcut-modal', 'shortcut-modal-title', 'shortcut-name', 'shortcut-url', 'shortcut-cancel', 'shortcut-save',
     'dialog-modal', 'dialog-title', 'dialog-message', 'dialog-input', 'dialog-cancel', 'dialog-ok',
@@ -156,6 +161,7 @@ const wireConnection = () => {
     const merged = upsertTab(incoming);
     if (existing?.pendingNavigation) delete merged.pendingNavigation;
     renderTabs();
+    if (els.app.classList.contains('is-newtab')) refreshHome();
     if (state.activeId === incoming.id) {
       renderToolbar();
       renderOmnibox();
@@ -184,6 +190,7 @@ const wireConnection = () => {
     node?.remove();
     tabNodes.delete(id);
     renderTabs();
+    if (els.app.classList.contains('is-newtab')) refreshHome();
     if (wasActive) {
       const remaining = orderedTabs();
       const next = remaining[Math.min(Math.max(index, 0), remaining.length - 1)];
@@ -229,6 +236,7 @@ const wireConnection = () => {
   });
 
   connection.addEventListener('dialog', (event) => showDialog(event.detail.dialog));
+  connection.addEventListener('screenshot', (event) => saveScreenshot(event.detail));
 
   connection.addEventListener('pong', (event) => {
     const sent = Number(event.detail.ts);
@@ -504,6 +512,10 @@ const goForward = () => sendTab({ t: 'forward' });
 const goHome = () => {
   const tab = activeTab();
   if (tab) {
+    if (tab.url) {
+      tab.lastUrl = tab.url;
+      tab.lastTitle = tab.title;
+    }
     tab.url = null;
     tab.title = 'New Tab';
     tab.pendingNavigation = false;
@@ -513,6 +525,19 @@ const goHome = () => {
   sendTab({ t: 'home' });
   applyActiveView();
   renderAll();
+};
+
+const resumeTab = (id) => {
+  const tab = state.tabs.get(id);
+  if (!tab) return;
+  if (!tab.url && tab.lastUrl) {
+    tab.url = tab.lastUrl;
+    tab.title = tab.lastTitle || tab.title;
+    send({ t: 'nav', tabId: id, input: tab.lastUrl });
+    activateTab(id);
+    return;
+  }
+  activateTab(id);
 };
 
 /* ------------------------------------------------------------------- render */
@@ -705,6 +730,8 @@ const wireChrome = () => {
     const tab = activeTab();
     if (tab?.url) copyText(tab.url);
   });
+  els.activityBtn?.addEventListener('click', () => openSystem());
+  els.fullscreenBtn?.addEventListener('click', () => toggleFullscreen());
   els.themeToggle.addEventListener('click', () => {
     const current = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
     setTheme(current === 'light' ? 'dark' : 'light');
@@ -720,6 +747,8 @@ const wireChrome = () => {
   els.settingsBtn.innerHTML = icon('settings', 18);
   els.bookmark.innerHTML = starIcon(false, 18);
   els.copyUrl.innerHTML = icon('link', 18);
+  if (els.activityBtn) els.activityBtn.innerHTML = icon('activity', 18);
+  if (els.fullscreenBtn) els.fullscreenBtn.innerHTML = icon('expand', 18);
 };
 
 const toggleBookmark = () => {
@@ -762,6 +791,36 @@ const copyText = async (text) => {
   }
 };
 
+const saveScreenshot = (detail) => {
+  const data = detail?.data;
+  if (!data) return;
+  try {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
+    const link = document.createElement('a');
+    const tab = activeTab();
+    const name = prettyHost(tab?.host) || 'page';
+    link.href = url;
+    link.download = `${name}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.jpg`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast('Screenshot saved', { tone: 'success' });
+  } catch {
+    toast('Could not save the screenshot', { tone: 'warn' });
+  }
+};
+
+const applyZoom = (value) => {
+  const next = setZoom(value);
+  state.settings.zoom = next;
+  saveSettings();
+  toast(`Zoom ${Math.round(next * 100)}%`, { tone: 'info', timeout: 1500 });
+};
+
 /* ------------------------------------------------------------------- keys */
 
 const wireGlobalKeys = () => {
@@ -797,7 +856,7 @@ const wireGlobalKeys = () => {
       }
       if (mod && key === 'k') {
         event.preventDefault();
-        startOmniEdit();
+        openPalette();
         return;
       }
       if (mod && key === 'r') {
@@ -813,6 +872,17 @@ const wireGlobalKeys = () => {
       if (event.key === 'F5') {
         event.preventDefault();
         reload();
+        return;
+      }
+      if (event.key === 'F11') {
+        event.preventDefault();
+        toggleFullscreen();
+        return;
+      }
+      if (mod && ['+', '=', '-', '_', '0'].includes(event.key)) {
+        event.preventDefault();
+        if (event.key === '0') applyZoom(1);
+        else applyZoom(getZoom() + (event.key === '-' || event.key === '_' ? -0.1 : 0.1));
         return;
       }
       if (mod && event.key === 'Tab') {
@@ -838,6 +908,7 @@ const wireGlobalKeys = () => {
         return;
       }
       if (event.key === 'Escape') {
+        if (closePalette()) return;
         if (els.settingsPanel.classList.contains('is-open')) {
           closeSettings();
           return;
@@ -964,7 +1035,7 @@ const setLoginError = (message) => {
 
 const wireLogin = () => {
   if (els.loginBrand) {
-    els.loginBrand.innerHTML = `${brandMark(34, 'login-brand-gradient')}<span>Velocity<em>Proxy</em></span>`;
+    els.loginBrand.innerHTML = `${brandMark(30)}<span>Velocity<em>Proxy</em></span>`;
   }
   els.loginForm.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -1102,13 +1173,66 @@ const wireSettingsEvents = () => {
   });
 };
 
+const paletteActions = {
+  activateTab,
+  newTab,
+  closeTab,
+  navigate,
+  reload,
+  goBack,
+  goForward,
+  goHome,
+  openSettings,
+  openSystem,
+  reopenClosed,
+  toggleFullscreen,
+  zoomIn: () => applyZoom(getZoom() + 0.1),
+  zoomOut: () => applyZoom(getZoom() - 0.1),
+  resetZoom: () => applyZoom(1),
+  screenshot: () => sendTab({ t: 'screenshot' }),
+  bookmark: toggleBookmark,
+  copyUrl: () => {
+    const tab = activeTab();
+    if (tab?.url) copyText(tab.url);
+  },
+  toggleMute: () => {
+    if (!audioEngine.started) {
+      audioEngine.enable().then(renderAudio).catch(() => {});
+      return;
+    }
+    audioEngine.setMuted(!audioEngine.muted);
+    state.settings.muted = audioEngine.muted;
+    saveSettings();
+    renderAudio();
+  },
+  toggleTheme: () => {
+    const current = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+    setTheme(current === 'light' ? 'dark' : 'light');
+  },
+  releaseIdle: async () => {
+    try {
+      const result = await api.post('/api/reclaim');
+      const released = Number(result?.released) || 0;
+      toast(
+        released ? `Released ${released} idle browser${released === 1 ? '' : 's'}` : 'Nothing idle to release',
+        { tone: released ? 'success' : 'info' },
+      );
+    } catch (error) {
+      toast(error.message || 'Could not release browsers', { tone: 'warn' });
+    }
+  },
+};
+
 const start = async () => {
   cacheElements();
   applyThemePreference();
   initSettings();
   wireAudio();
   initViewport({ send });
-  initHome({ onNavigate: navigate });
+  setZoom(state.settings.zoom || 1);
+  initHome({ onNavigate: navigate, onActivateTab: resumeTab });
+  initPalette({ actions: paletteActions });
+  initSystem();
   wireChrome();
   wireOmnibox();
   wireDialogs();

@@ -3,24 +3,32 @@ import {
   engineName,
   frequentSites,
   historyFor,
+  orderedTabs,
   removeShortcut,
+  saveSettings,
   saveShortcuts,
   state,
   updateShortcut,
 } from './store.js';
 import { createSuggester, faviconNode, menu, prettyHost, timeAgo, toast } from './ui.js';
-import { saveSettings } from './store.js';
 
 let navigate = () => {};
+let activateTab = () => {};
 let shortcutEditingIndex = -1;
 let clockTimer = null;
 const dom = {};
 
-export const initHome = ({ onNavigate }) => {
-  navigate = onNavigate;
+export const initHome = ({ onNavigate, onActivateTab }) => {
+  navigate = onNavigate || (() => {});
+  activateTab = onActivateTab || (() => {});
+
   dom.newtab = document.getElementById('newtab');
   dom.shortcuts = document.getElementById('shortcuts');
+  dom.continueSection = document.getElementById('continue-section');
+  dom.continueList = document.getElementById('continue');
+  dom.continueCount = document.getElementById('continue-count');
   dom.recent = document.getElementById('recent');
+  dom.recentCount = document.getElementById('recent-count');
   dom.frequent = document.getElementById('frequent');
   dom.input = document.getElementById('nt-input');
   dom.suggest = document.getElementById('nt-suggest');
@@ -30,7 +38,6 @@ export const initHome = ({ onNavigate }) => {
   dom.greeting = document.getElementById('greeting');
   dom.clock = document.getElementById('nt-clock');
   dom.date = document.getElementById('nt-date');
-  dom.addShortcut = document.getElementById('add-shortcut');
   dom.brand = document.getElementById('nt-brand');
   dom.modal = document.getElementById('shortcut-modal');
   dom.modalTitle = document.getElementById('shortcut-modal-title');
@@ -40,7 +47,7 @@ export const initHome = ({ onNavigate }) => {
   dom.modalCancel = document.getElementById('shortcut-cancel');
 
   if (dom.brand && !dom.brand.dataset.ready) {
-    dom.brand.innerHTML = `${brandMark(28, 'nt-brand-gradient')}<span class="nt-brand-text">Velocity<em>Proxy</em></span>`;
+    dom.brand.innerHTML = `${brandMark(26)}<span class="nt-brand-text">Velocity<em>Proxy</em></span>`;
     dom.brand.dataset.ready = '1';
   }
 
@@ -90,7 +97,6 @@ export const initHome = ({ onNavigate }) => {
     );
   });
 
-  dom.addShortcut?.addEventListener('click', () => openShortcutModal(-1));
   dom.modalCancel?.addEventListener('click', closeShortcutModal);
   dom.modalSave?.addEventListener('click', saveShortcutModal);
   dom.modalName?.addEventListener('keydown', (event) => {
@@ -134,20 +140,147 @@ export const refreshHome = () => {
   if (!dom.shortcuts) return;
   dom.engineName.textContent = state.settings.engine === 'custom' ? 'Custom' : engineName();
   updatePlaceholder();
+  renderContinue();
   renderShortcuts();
-  renderSiteList(dom.recent, historyFor(6), 'Nothing here yet. Pages you open will show up here.');
-  renderSiteList(
-    dom.frequent,
-    frequentSites(6).map((site) => ({
-      url: site.url,
-      title: site.title,
-      host: site.host,
-      ts: site.ts,
-      visits: site.visits,
-    })),
-    'Visit a few sites and your most-used ones will appear here.',
-  );
+  renderRecent();
+  renderFrequent();
 };
+
+/* ------------------------------------------------------------------ continue */
+
+const renderContinue = () => {
+  if (!dom.continueSection || !dom.continueList) return;
+  const tabs = orderedTabs().filter((tab) => tab.url || tab.lastUrl);
+  dom.continueSection.hidden = tabs.length === 0;
+  dom.continueList.innerHTML = '';
+  if (dom.continueCount) dom.continueCount.textContent = tabs.length ? `${tabs.length} open` : '';
+
+  for (const tab of tabs.slice(0, 6)) {
+    const target = tab.url || tab.lastUrl;
+    const host = prettyHost(tab.host || safeHost(target));
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'continue-row';
+    const fav = document.createElement('span');
+    fav.className = 'site-fav';
+    fav.appendChild(faviconNode(tab.favicon || (host ? `/api/favicon?host=${encodeURIComponent(host)}` : null), host, 18));
+    const text = document.createElement('span');
+    text.className = 'site-text';
+    const title = document.createElement('strong');
+    title.textContent = (tab.url ? tab.title : tab.lastTitle) || tab.title || host || 'New tab';
+    const meta = document.createElement('span');
+    meta.textContent = host;
+    text.append(title, meta);
+    const kind = document.createElement('span');
+    kind.className = 'continue-kind';
+    kind.textContent = tab.url ? (tab.loading ? 'Loading' : 'Open') : 'Resume';
+    button.append(fav, text, kind);
+    button.addEventListener('click', () => activateTab(tab.id));
+    dom.continueList.appendChild(button);
+  }
+};
+
+/* -------------------------------------------------------------------- recent */
+
+const dayLabel = (timestamp) => {
+  const date = new Date(timestamp || 0);
+  const now = new Date();
+  const startOf = (value) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const days = Math.round((startOf(now) - startOf(date)) / 86_400_000);
+  if (!Number.isFinite(days) || days < 0 || !timestamp) return 'Earlier';
+  if (days === 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days < 7) return new Intl.DateTimeFormat(undefined, { weekday: 'long' }).format(date);
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(date);
+};
+
+const renderRecent = () => {
+  if (!dom.recent) return;
+  const entries = historyFor(14);
+  dom.recent.innerHTML = '';
+  if (dom.recentCount) dom.recentCount.textContent = entries.length ? `${entries.length} visits` : '';
+
+  if (!entries.length) {
+    const empty = document.createElement('li');
+    empty.className = 'site-empty';
+    empty.textContent = 'Pages you open will show up here, grouped by day.';
+    dom.recent.appendChild(empty);
+    return;
+  }
+
+  let label = '';
+  for (const entry of entries) {
+    const next = dayLabel(entry.ts);
+    if (next !== label) {
+      label = next;
+      const heading = document.createElement('li');
+      heading.className = 'site-day';
+      heading.textContent = label;
+      dom.recent.appendChild(heading);
+    }
+    dom.recent.appendChild(siteRow(entry));
+  }
+};
+
+const siteRow = (entry) => {
+  const host = entry.host || safeHost(entry.url);
+  const item = document.createElement('li');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'site-row';
+  const favWrap = document.createElement('span');
+  favWrap.className = 'site-fav';
+  favWrap.appendChild(faviconNode(`/api/favicon?host=${encodeURIComponent(host)}`, prettyHost(host), 18));
+  const text = document.createElement('span');
+  text.className = 'site-text';
+  const title = document.createElement('strong');
+  title.textContent = entry.title || prettyHost(host);
+  const meta = document.createElement('span');
+  meta.textContent = `${prettyHost(host)}${entry.visits > 1 ? ` · ${entry.visits} visits` : entry.ts ? ` · ${timeAgo(entry.ts)}` : ''}`;
+  text.append(title, meta);
+  const arrow = document.createElement('span');
+  arrow.className = 'site-open';
+  arrow.innerHTML = icon('arrowRight', 15);
+  button.append(favWrap, text, arrow);
+  button.addEventListener('click', () => navigate(entry.url));
+  button.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    menu.open(event.clientX, event.clientY, [
+      { label: 'Open', icon: 'arrowRight', onSelect: () => navigate(entry.url) },
+      { label: 'Copy link', icon: 'link', onSelect: () => copyText(entry.url) },
+    ]);
+  });
+  item.appendChild(button);
+  return item;
+};
+
+const renderFrequent = () => {
+  if (!dom.frequent) return;
+  dom.frequent.innerHTML = '';
+  const sites = frequentSites(8);
+  if (!sites.length) {
+    const empty = document.createElement('p');
+    empty.className = 'freq-empty';
+    empty.textContent = 'Visit a few sites and the ones you return to will appear here.';
+    dom.frequent.appendChild(empty);
+    return;
+  }
+  for (const site of sites) {
+    const host = prettyHost(site.host);
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'freq-chip';
+    chip.title = site.url;
+    chip.appendChild(faviconNode(`/api/favicon?host=${encodeURIComponent(site.host)}`, host, 14));
+    const label = document.createElement('span');
+    label.textContent = host;
+    chip.appendChild(label);
+    chip.addEventListener('click', () => navigate(site.url));
+    dom.frequent.appendChild(chip);
+  }
+};
+
+/* ----------------------------------------------------------------- shortcuts */
 
 const renderShortcuts = () => {
   dom.shortcuts.innerHTML = '';
@@ -196,48 +329,7 @@ const renderShortcuts = () => {
   dom.shortcuts.appendChild(add);
 };
 
-const renderSiteList = (container, entries, emptyText) => {
-  if (!container) return;
-  container.innerHTML = '';
-  if (!entries.length) {
-    const empty = document.createElement('li');
-    empty.className = 'site-empty';
-    empty.textContent = emptyText;
-    container.appendChild(empty);
-    return;
-  }
-  for (const entry of entries) {
-    const host = entry.host || safeHost(entry.url);
-    const item = document.createElement('li');
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'site-row';
-    const favWrap = document.createElement('span');
-    favWrap.className = 'site-fav';
-    favWrap.appendChild(faviconNode(`/api/favicon?host=${encodeURIComponent(host)}`, prettyHost(host), 18));
-    const text = document.createElement('span');
-    text.className = 'site-text';
-    const title = document.createElement('strong');
-    title.textContent = entry.title || prettyHost(host);
-    const meta = document.createElement('span');
-    meta.textContent = `${prettyHost(host)}${entry.visits > 1 ? ` · ${entry.visits} visits` : entry.ts ? ` · ${timeAgo(entry.ts)}` : ''}`;
-    text.append(title, meta);
-    const arrow = document.createElement('span');
-    arrow.className = 'site-open';
-    arrow.innerHTML = icon('arrowRight', 16);
-    button.append(favWrap, text, arrow);
-    button.addEventListener('click', () => navigate(entry.url));
-    button.addEventListener('contextmenu', (event) => {
-      event.preventDefault();
-      menu.open(event.clientX, event.clientY, [
-        { label: 'Open', icon: 'arrowRight', onSelect: () => navigate(entry.url) },
-        { label: 'Copy link', icon: 'link', onSelect: () => copyText(entry.url) },
-      ]);
-    });
-    item.appendChild(button);
-    container.appendChild(item);
-  }
-};
+/* ------------------------------------------------------------------- modal */
 
 const openShortcutModal = (index) => {
   shortcutEditingIndex = index;
@@ -255,6 +347,7 @@ const closeShortcutModal = () => {
 };
 
 const saveShortcutModal = () => {
+  const wasEditing = shortcutEditingIndex >= 0;
   const title = dom.modalName.value.trim();
   let url = dom.modalUrl.value.trim();
   if (!url) {
@@ -281,7 +374,7 @@ const saveShortcutModal = () => {
   }
   renderShortcuts();
   closeShortcutModal();
-  toast(shortcutEditingIndex >= 0 ? 'Shortcut updated' : 'Shortcut added', { tone: 'success' });
+  toast(wasEditing ? 'Shortcut updated' : 'Shortcut added', { tone: 'success' });
 };
 
 const copyText = async (text) => {
@@ -314,7 +407,7 @@ const startClock = () => {
     if (dom.greeting) {
       const hour = now.getHours();
       dom.greeting.textContent =
-        hour < 5 ? 'Good night' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+        hour < 5 ? 'Good night.' : hour < 12 ? 'Good morning.' : hour < 18 ? 'Good afternoon.' : 'Good evening.';
     }
   };
   tick();

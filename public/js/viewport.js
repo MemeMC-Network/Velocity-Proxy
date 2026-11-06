@@ -18,6 +18,9 @@ let lastClick = { at: 0, x: 0, y: 0, count: 1 };
 let touch = null;
 let moveScheduled = false;
 let pendingMove = null;
+let zoom = 1;
+let frameSize = null;
+let contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -50,6 +53,16 @@ export const initViewport = ({ send }) => {
   observeResize();
   applySize();
 
+  // Hidden viewers should not pay for JPEG encoding on the server.
+  document.addEventListener('visibilitychange', () => {
+    publishStreaming();
+    if (!document.hidden) applySize();
+  });
+  document.addEventListener('fullscreenchange', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => applySize(), 40);
+  });
+
   connection.addEventListener('frame', (event) => {
     pendingFrame = event.detail;
     if (!decoding) pump();
@@ -65,6 +78,14 @@ export const initViewport = ({ send }) => {
     if (Number.isFinite(detail.width) && Number.isFinite(detail.height)) {
       remote = { width: detail.width, height: detail.height };
     }
+  });
+
+  connection.addEventListener('fullscreen', (event) => {
+    const detail = event.detail || {};
+    if (detail.tabId && currentTabId && detail.tabId !== currentTabId) return;
+    document.body.classList.toggle('is-remote-fullscreen', Boolean(detail.on));
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => applySize(), 60);
   });
 
   connection.addEventListener('status', (event) => {
@@ -92,8 +113,11 @@ export const setActiveTab = (tab) => {
   if (id !== currentTabId) {
     currentTabId = id;
     hasFrame = false;
+    frameSize = null;
+    contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
     clearCanvas();
     hideOverlay();
+    publishStreaming();
   }
   if (!tab || !tab.url) {
     hideOverlay();
@@ -105,8 +129,10 @@ export const setActiveTab = (tab) => {
 export const clearViewport = () => {
   currentTabId = null;
   hasFrame = false;
+  frameSize = null;
   clearCanvas();
   hideOverlay();
+  document.body.classList.remove('is-remote-fullscreen');
 };
 
 export const requestedSize = () => ({ ...requested });
@@ -246,27 +272,59 @@ const applySize = () => {
     dom.canvas.width = bufferWidth;
     dom.canvas.height = bufferHeight;
     clearCanvas();
+    if (frameSize) fitContent();
   }
-  if (Math.abs(cssWidth - requested.width) > 4 || Math.abs(cssHeight - requested.height) > 4) {
-    requested = { width: cssWidth, height: cssHeight };
-    if (currentTabId) {
-      sendMessage({ t: 'viewport', tabId: currentTabId, width: cssWidth, height: cssHeight });
-    }
+  // Zoom narrows the remote CSS viewport so the page reflows for real instead of
+  // being scaled blurrily on this side.
+  const targetWidth = Math.max(320, Math.round(cssWidth / zoom));
+  const targetHeight = Math.max(240, Math.round(cssHeight / zoom));
+  if (Math.abs(targetWidth - requested.width) > 6 || Math.abs(targetHeight - requested.height) > 6) {
+    requested = { width: targetWidth, height: targetHeight };
+    publishViewport();
   }
 };
 
-export const ensureSizePublished = () => {
+const publishViewport = () => {
   if (!currentTabId) return;
   sendMessage({ t: 'viewport', tabId: currentTabId, width: requested.width, height: requested.height });
 };
 
+const publishStreaming = () => {
+  if (!currentTabId) return;
+  sendMessage({ t: 'stream', tabId: currentTabId, active: !document.hidden });
+};
+
+export const ensureSizePublished = () => publishViewport();
+
+/** Maps a pointer event onto the letterboxed frame, not the whole canvas. */
 const mapPoint = (event) => {
   const rect = dom.canvas.getBoundingClientRect();
-  const sx = remote.width / Math.max(1, rect.width);
-  const sy = remote.height / Math.max(1, rect.height);
+  const canvasX = (event.clientX - rect.left) * (dom.canvas.width / Math.max(1, rect.width));
+  const canvasY = (event.clientY - rect.top) * (dom.canvas.height / Math.max(1, rect.height));
+  if (!contentRect.width) fitContent();
+  const scale = contentRect.scale || 1;
+  const width = frameSize?.width || remote.width;
+  const height = frameSize?.height || remote.height;
   return {
-    x: clamp((event.clientX - rect.left) * sx, 0, remote.width),
-    y: clamp((event.clientY - rect.top) * sy, 0, remote.height),
+    x: clamp((canvasX - contentRect.x) / scale, 0, width),
+    y: clamp((canvasY - contentRect.y) / scale, 0, height),
+  };
+};
+
+/** Fits the incoming frame inside the canvas, preserving its aspect ratio. */
+const fitContent = () => {
+  if (!dom.canvas) return;
+  const width = frameSize?.width || remote.width || 1;
+  const height = frameSize?.height || remote.height || 1;
+  const scale = Math.min(dom.canvas.width / width, dom.canvas.height / height);
+  const drawWidth = Math.max(1, width * scale);
+  const drawHeight = Math.max(1, height * scale);
+  contentRect = {
+    x: Math.round((dom.canvas.width - drawWidth) / 2),
+    y: Math.round((dom.canvas.height - drawHeight) / 2),
+    width: Math.round(drawWidth),
+    height: Math.round(drawHeight),
+    scale,
   };
 };
 
@@ -285,16 +343,24 @@ const drawFrame = async (buffer) => {
   if (!buffer || buffer.byteLength < 8) return;
   const view = new DataView(buffer);
   if (view.getUint32(0) !== MAGIC) return;
+  const version = view.getUint8(4);
   const idLength = view.getUint8(5);
+  const sized = version >= 2 && buffer.byteLength >= 10 + idLength;
+  const idOffset = sized ? 10 : 6;
   let tabId = '';
   try {
-    tabId = new TextDecoder().decode(new Uint8Array(buffer, 6, idLength));
+    tabId = new TextDecoder().decode(new Uint8Array(buffer, idOffset, idLength));
   } catch {
     return;
   }
   if (!currentTabId || tabId !== currentTabId) return;
+  if (sized) {
+    const width = view.getUint16(6);
+    const height = view.getUint16(8);
+    if (width && height) frameSize = { width, height };
+  }
 
-  const jpeg = new Uint8Array(buffer, 6 + idLength);
+  const jpeg = new Uint8Array(buffer, idOffset + idLength);
   const blob = new Blob([jpeg], { type: 'image/jpeg' });
   let bitmap = null;
   if (typeof createImageBitmap === 'function') {
@@ -309,7 +375,12 @@ const drawFrame = async (buffer) => {
     bitmap.close();
     return;
   }
-  dom.ctx.drawImage(bitmap, 0, 0, dom.canvas.width, dom.canvas.height);
+  if (dom.ctx) {
+    dom.ctx.fillStyle = '#07070a';
+    dom.ctx.fillRect(0, 0, dom.canvas.width, dom.canvas.height);
+    fitContent();
+    dom.ctx.drawImage(bitmap, contentRect.x, contentRect.y, contentRect.width, contentRect.height);
+  }
   bitmap.close();
   hasFrame = true;
   if (overlayMode === 'loading') hideOverlay();
@@ -512,6 +583,25 @@ export const pasteFromClipboard = async () => {
     /* permission denied */
   }
 };
+
+export const toggleFullscreen = () => {
+  try {
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else document.documentElement.requestFullscreen?.();
+  } catch {
+    /* fullscreen is unavailable inside some frames */
+  }
+};
+
+export const setZoom = (value) => {
+  const next = clamp(Number(value) || 1, 0.5, 2);
+  if (Math.abs(next - zoom) < 0.01) return zoom;
+  zoom = next;
+  applySize();
+  return zoom;
+};
+
+export const getZoom = () => zoom;
 
 export const isEditableTarget = (target) => {
   if (!target || !(target instanceof Element)) return false;

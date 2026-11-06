@@ -55,6 +55,8 @@ export class TabSession extends EventEmitter {
     this.closing = false;
     this.intentionalClose = false;
     this.streaming = false;
+    this.streamingActive = true;
+    this.fullscreen = false;
     this.quality = config.frameQuality;
     this.viewport = { width: 1280, height: 800 };
     this.pinned = Boolean(meta.pinned);
@@ -78,6 +80,7 @@ export class TabSession extends EventEmitter {
     this.faviconUrl = null;
     this.frameSizeEma = 0;
     this.lastQualityChange = 0;
+    this.lastFrameSentAt = 0;
 
     this.muted = Boolean(meta.muted);
     this.audible = false;
@@ -158,8 +161,7 @@ export class TabSession extends EventEmitter {
 
     if (this.muted) await this.setMuted(true, { quiet: true }).catch(() => {});
 
-    this.pollTimer = setInterval(() => this.poll(), 1100);
-    this.pollTimer.unref?.();
+    this.schedulePoll();
     this.emitState();
   }
 
@@ -228,7 +230,24 @@ export class TabSession extends EventEmitter {
     this.settleTimer.unref?.();
   }
 
-  async poll() {
+  /** Prompts the page on a fast cadence while watched, slowly when unwatched. */
+  poll() {
+    return this.pollOnce()
+      .catch(() => {})
+      .finally(() => this.schedulePoll());
+  }
+
+  schedulePoll() {
+    clearTimeout(this.pollTimer);
+    if (this.closed || !this.isLive()) return;
+    this.pollTimer = setTimeout(
+      () => this.poll(),
+      this.hasViewers() ? 1100 : this.config.idlePollMs,
+    );
+    this.pollTimer.unref?.();
+  }
+
+  async pollOnce() {
     if (this.closed || this.polling || !this.isLive()) return;
     if (!this.hasViewers() && Date.now() - this.lastActivity > 20000) return;
     this.polling = true;
@@ -249,6 +268,7 @@ export class TabSession extends EventEmitter {
             href: location.href,
             ready: document.readyState,
             audible: media.some((el) => !el.paused && !el.muted && el.volume > 0),
+            fullscreen: Boolean(document.fullscreenElement),
           };
         }, this.muted),
         new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
@@ -256,6 +276,10 @@ export class TabSession extends EventEmitter {
       if (!info || this.closed) return;
 
       let changed = false;
+      if (Boolean(info.fullscreen) !== this.fullscreen) {
+        this.fullscreen = Boolean(info.fullscreen);
+        this.emit('fullscreen', this.fullscreen);
+      }
       if (Boolean(info.audible) !== this.audible) {
         this.audible = Boolean(info.audible);
         changed = true;
@@ -435,7 +459,7 @@ export class TabSession extends EventEmitter {
   }
 
   async startStreaming() {
-    if (this.streaming || this.closed || !this.cdp) return;
+    if (this.streaming || this.closed || !this.cdp || !this.streamingActive) return;
     this.streaming = true;
     try {
       await this.cdp.send('Page.startScreencast', {
@@ -466,25 +490,53 @@ export class TabSession extends EventEmitter {
     await this.startStreaming();
   }
 
+  /**
+   * A hidden viewer needs no frames. Stopping the screencast also stops
+   * Chromium's JPEG encoding, which is the biggest CPU cost of a live tab.
+   */
+  async setStreamingActive(active) {
+    const next = Boolean(active);
+    this.lastActivity = Date.now();
+    if (next === this.streamingActive) {
+      if (next && !this.streaming) await this.startStreaming();
+      return;
+    }
+    this.streamingActive = next;
+    if (next) await this.startStreaming();
+    else await this.stopStreaming();
+  }
+
   handleScreencastFrame(event) {
     if (!this.cdp || this.closed) return;
     this.cdp.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => {});
     const viewers = this.viewers();
     if (!viewers.length) return;
 
+    // Chromium emits on damage, often faster than a browser view can use. Drop
+    // the extra captures before packetising them (SCREENCAST_FPS).
+    const now = Date.now();
+    const minInterval = 1000 / (this.config.screencastFps || 60);
+    if (now - this.lastFrameSentAt < minInterval) return;
+    this.lastFrameSentAt = now;
+
     const frame = Buffer.from(event.data, 'base64');
     const idBuffer = Buffer.from(this.id, 'utf8').subarray(0, 32);
-    const header = Buffer.alloc(6);
+    // Version 2 carries the frame's own pixel size, so the client can letterbox
+    // instead of stretching whenever page size and viewport disagree.
+    const width = clamp(Math.round(event.metadata?.deviceWidth || this.viewport.width), 1, 65535);
+    const height = clamp(Math.round(event.metadata?.deviceHeight || this.viewport.height), 1, 65535);
+    const header = Buffer.alloc(10);
     header.writeUInt32BE(MAGIC, 0);
-    header.writeUInt8(1, 4);
+    header.writeUInt8(2, 4);
     header.writeUInt8(idBuffer.length, 5);
+    header.writeUInt16BE(width, 6);
+    header.writeUInt16BE(height, 8);
     const packet = Buffer.concat([header, idBuffer, frame]);
 
     for (const client of viewers) client.sendFrame(packet);
     this.lastActivity = Date.now();
 
     this.frameSizeEma = this.frameSizeEma ? this.frameSizeEma * 0.9 + frame.length * 0.1 : frame.length;
-    const now = Date.now();
     if (now - this.lastQualityChange > 5000) {
       let next = this.quality;
       if (this.frameSizeEma > 240000) next = Math.max(32, this.quality - 8);
@@ -503,6 +555,15 @@ export class TabSession extends EventEmitter {
     this.quality = quality;
     this.lastQualityChange = Date.now();
     this.restartStreaming().catch(() => {});
+  }
+
+  /** JPEG capture of the current viewport, for the client to save. */
+  async captureScreenshot(quality = 82) {
+    if (!this.isLive() || this.closed) return null;
+    const result = await this.cdp
+      .send('Page.captureScreenshot', { format: 'jpeg', quality, captureBeyondViewport: false })
+      .catch(() => null);
+    return result?.data || null;
   }
 
   async setViewport(width, height, { force = false } = {}) {
@@ -787,7 +848,7 @@ export class TabSession extends EventEmitter {
   }
 
   clearTimers() {
-    clearInterval(this.pollTimer);
+    clearTimeout(this.pollTimer);
     clearTimeout(this.settleTimer);
     clearTimeout(this.loadingTimer);
     clearTimeout(this.faviconTimer);

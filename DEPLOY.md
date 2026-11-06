@@ -1,7 +1,8 @@
 # Deploying Velocity Proxy
 
-Velocity Proxy is a **stateful, long-running server**: one Node process keeps a live Chromium
-instance, WebSocket streams for frames and audio, and on-disk tab/cookie state.
+Velocity Proxy is a **stateful, long-running server**: one Node process keeps live Chromium
+instances (one per signed-in session when per-session audio is on), WebSocket streams for frames and
+audio, and on-disk tab/cookie state.
 
 That shape rules out Vercel Functions (and Netlify Functions, Cloudflare Pages Functions, AWS
 Lambda): those run request/response handlers with no WebSocket upgrade, no persistent process
@@ -21,6 +22,16 @@ ACCESS_PASSWORD='choose-something-strong' docker compose up -d --build
 `docker-compose.yml` mounts a named volume for `/data` (tabs, cookies, session secret) and builds
 the image with Chromium, ffmpeg and PulseAudio. Put the service behind HTTPS (Caddy, Nginx,
 Traefik, or your platform's load balancer) so session cookies work inside iframes.
+
+Audio is per session by default: every signed-in visitor gets a Chromium process, a PulseAudio sink
+and a capture of their own, so nobody hears another visitor's tabs. That costs one browser per
+concurrent session — on a 1 GB host set `AUDIO_PER_SESSION=0` to keep a single shared browser and
+one shared capture instead.
+
+Memory and CPU are bounded either way: `MAX_LIVE_BROWSERS` caps concurrent Chromium processes (idle
+sessions are evicted first), `MAX_LIVE_TABS` caps live pages, `BROWSER_IDLE_SECONDS` frees a
+disconnected session's browser, `SCREENCAST_FPS` limits frame encoding, and unwatched tabs are
+polled every `IDLE_POLL_MS` instead of every 1.1 s.
 
 `PUBLIC_ORIGIN` is optional but recommended once you have a domain:
 
@@ -86,6 +97,13 @@ Notes:
 - If the embedding browser blocks unpartitioned third-party cookies (Safari ITP, Chrome with 3P
   cookies disabled), set `EMBED_PARTITIONED_COOKIES=1` to use CHIPS. Each top-level site then gets
   its own isolated session, which is usually the desired behaviour for an embedded widget.
+- A page opened from disk (`file://`) can only frame the proxy if the scheme is listed:
+  `FRAME_ANCESTORS=* file:`. CSP's `*` deliberately does not match non-network schemes, so the
+  frame is refused otherwise. The proxy is still served over HTTPS, so cookies and the WebSocket
+  work normally.
 - `allow="autoplay"` lets the audio stream start after the visitor's first click inside the frame.
+- Audio is isolated per session: a visitor hears only the tabs of their own login, never those of
+  someone else using the same deployment. Each session has its own Chromium process, so budget RAM
+  accordingly; `AUDIO_PER_SESSION=0` restores one shared browser and capture.
 - The address bar of the *top* page is never touched: navigation, tabs and refreshes all happen
   inside the framed document, whose URL stays at `/`.

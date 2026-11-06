@@ -1,55 +1,58 @@
 import { execFile, spawn } from 'node:child_process';
 import { log } from '../logger.js';
+import { shortHash } from '../util.js';
 
 const MAX_BUFFERED = 1_200_000;
 const IDLE_STOP_MS = 12_000;
 // EBML Cluster id: everything before it is the WebM header a late client needs.
 const CLUSTER_ID = Buffer.from([0x1f, 0x43, 0xb6, 0x75]);
+const SHARED_KEY = 'shared';
+const SINK_RETRY_MS = 60_000;
 
 /**
- * Captures the audio that Chromium sends to the server's sound system and
- * streams it as live WebM/Opus to the browser.
+ * Streams the audio of a browser session to the people watching that session.
  *
- * Chromium renders page audio into one output device (a PulseAudio null sink on
- * Linux, a DirectShow loopback device on Windows, or a generated tone for
- * transport tests). ffmpeg reads that device and writes WebM/Opus to stdout;
- * each connected client receives the same stream over `/ws/audio` and plays it
- * through Media Source Extensions. Per-tab muting happens inside the page, so
- * the mix only ever contains the active tab's media.
+ * Chromium only chooses its output device per process, so per-session audio
+ * means one Chromium process per signed-in visitor (`WorkspaceManager`) playing
+ * into a PulseAudio null sink of its own (`velocity_<session>`). ffmpeg records
+ * that sink's monitor and only sockets carrying the same session key receive
+ * it, so two visitors never hear each other's tabs.
+ *
+ * `AUDIO_SOURCE=tone` also gets one capture per session, which keeps the
+ * transport testable without a sound card. DirectShow on Windows exposes a
+ * single system-wide loopback device, so it stays one shared capture.
  */
 export class AudioService {
   constructor(config) {
     this.config = config;
-    this.proc = null;
-    this.sockets = new Set();
-    this.backend = null;
-    this.reason = '';
-    this.status = 'idle';
-    this.starting = null;
-    this.stderr = '';
-    this.stopTimer = null;
+    this.streams = new Map(); // capture key -> AudioStream
+    this.sinks = new Map(); // capture key -> { name, moduleId }
+    this.sinkFailure = null; // { message, at }
     this.ffmpegChecked = null;
-    this.bytes = 0;
-    this.startedAt = 0;
-    this.header = null;
-    this.headerBuf = null;
   }
 
   get enabled() {
     return Boolean(this.config.audioEnabled) && this.config.audioSource !== 'off';
   }
 
-  info() {
-    return {
-      enabled: this.enabled,
-      status: this.enabled ? this.status : 'disabled',
-      backend: this.backend?.id || null,
-      backendLabel: this.backend?.label || null,
-      reason: this.enabled ? this.reason || '' : 'Audio is disabled on this server (AUDIO_ENABLED=0 or AUDIO_SOURCE=off).',
-      bitrateKbps: this.config.audioBitrateKbps,
-      listeners: this.sockets.size,
-      platform: process.platform,
-    };
+  /** The backend `AUDIO_SOURCE` resolves to, without spawning anything. */
+  get backendKind() {
+    if (!this.enabled) return null;
+    const source = this.config.audioSource;
+    if (source === 'pulse' || source === 'dshow' || source === 'tone') return source;
+    if (process.platform === 'win32') return this.config.audioDevice ? 'dshow' : null;
+    if (process.platform === 'linux') return 'pulse';
+    return null;
+  }
+
+  /** True when every session can have a capture of its own. */
+  get perSession() {
+    const kind = this.backendKind;
+    return Boolean(this.config.audioPerSession) && (kind === 'pulse' || kind === 'tone');
+  }
+
+  get streamCount() {
+    return this.streams.size;
   }
 
   ffmpegAvailable() {
@@ -60,48 +63,216 @@ export class AudioService {
     return this.ffmpegChecked;
   }
 
+  /* ---------------------------------------------------------------- sinks */
+
+  /** PulseAudio sink name for a session; short and hex-only. */
+  sinkName(key) {
+    return `velocity_${shortHash(key, 16)}`;
+  }
+
+  sinkFor(key) {
+    return this.sinks.get(key)?.name || null;
+  }
+
+  pulseEnv() {
+    return this.config.audioPulseServer
+      ? { ...process.env, PULSE_SERVER: this.config.audioPulseServer }
+      : process.env;
+  }
+
+  /**
+   * Creates the session's sink (idempotent) and returns its name, or null when
+   * the sink could not be created - in that case the capture falls back to the
+   * shared device so audio still works, just not per session.
+   */
+  async prepareSink(key) {
+    if (!this.perSession || this.backendKind !== 'pulse') return null;
+    const existing = this.sinks.get(key);
+    if (existing) return existing.name;
+    if (this.sinkFailure && Date.now() - this.sinkFailure.at < SINK_RETRY_MS) return null;
+
+    const name = this.sinkName(key);
+    const moduleId = await this.loadSink(name);
+    if (!moduleId) return null;
+    this.sinkFailure = null;
+    this.sinks.set(key, { name, moduleId });
+    return name;
+  }
+
+  loadSink(name) {
+    return new Promise((resolve) => {
+      execFile(
+        this.config.audioPactlPath,
+        [
+          'load-module',
+          'module-null-sink',
+          `sink_name=${name}`,
+          'rate=48000',
+          'channels=2',
+          'sink_properties=device.description=VelocityProxy-Session',
+        ],
+        { timeout: 5000, env: this.pulseEnv() },
+        (error, stdout) => {
+          if (error) {
+            const message = `Could not create a per-session audio sink (${String(error.message).split('\n')[0]}); falling back to one shared capture.`;
+            if (!this.sinkFailure) log.warn(message);
+            this.sinkFailure = { message, at: Date.now() };
+            resolve(null);
+            return;
+          }
+          resolve(String(stdout).trim().split(/\s+/)[0] || null);
+        },
+      );
+    });
+  }
+
+  releaseSink(key) {
+    const entry = this.sinks.get(key);
+    if (!entry) return;
+    this.sinks.delete(key);
+    if (!entry.moduleId) return;
+    execFile(
+      this.config.audioPactlPath,
+      ['unload-module', String(entry.moduleId)],
+      { timeout: 5000, env: this.pulseEnv() },
+      () => {},
+    );
+  }
+
+  /* -------------------------------------------------------------- streams */
+
+  /** Session keys are only honoured when each session can be routed apart. */
+  keyFor(key) {
+    return this.perSession ? String(key || 'default') : SHARED_KEY;
+  }
+
+  streamFor(key) {
+    const id = this.keyFor(key);
+    let stream = this.streams.get(id);
+    if (!stream) {
+      stream = new AudioStream(this, id);
+      this.streams.set(id, stream);
+    }
+    return stream;
+  }
+
+  attach(key, ws) {
+    this.streamFor(key).attach(ws);
+  }
+
+  info(key) {
+    if (!this.enabled) {
+      return {
+        enabled: false,
+        status: 'disabled',
+        backend: null,
+        backendLabel: null,
+        reason: 'Audio is disabled on this server (AUDIO_ENABLED=0 or AUDIO_SOURCE=off).',
+        bitrateKbps: this.config.audioBitrateKbps,
+        listeners: 0,
+        platform: process.platform,
+        perSession: false,
+        isolated: false,
+      };
+    }
+    return this.streamFor(key).info();
+  }
+
+  overallStatus() {
+    if (!this.enabled) return 'disabled';
+    if (!this.streams.size) return 'idle';
+    const statuses = [...this.streams.values()].map((stream) => stream.status);
+    if (statuses.includes('live')) return 'live';
+    if (statuses.includes('unavailable')) return 'unavailable';
+    if (statuses.includes('starting')) return 'starting';
+    return 'idle';
+  }
+
+  /** Drops a session's capture and sink, e.g. when its browser goes away. */
+  releaseSession(key) {
+    const id = this.keyFor(key);
+    const stream = this.streams.get(id);
+    if (stream) {
+      stream.stop();
+      this.streams.delete(id);
+    }
+    this.releaseSink(id);
+  }
+
+  stop() {
+    for (const stream of this.streams.values()) stream.stop();
+    this.streams.clear();
+    for (const key of [...this.sinks.keys()]) this.releaseSink(key);
+  }
+}
+
+/** One ffmpeg capture (and its listeners) for one session. */
+class AudioStream {
+  constructor(hub, key) {
+    this.hub = hub;
+    this.config = hub.config;
+    this.key = key;
+    this.shared = key === SHARED_KEY;
+    this.proc = null;
+    this.sockets = new Set();
+    this.backend = null;
+    this.reason = '';
+    this.status = 'idle';
+    this.starting = null;
+    this.stderr = '';
+    this.stopTimer = null;
+    this.bytes = 0;
+    this.startedAt = 0;
+    this.header = null;
+    this.headerBuf = null;
+  }
+
+  info() {
+    const backend = this.backend || this.resolveBackend();
+    const enabled = this.hub.enabled;
+    return {
+      enabled,
+      status: enabled ? this.status : 'disabled',
+      backend: backend?.id || null,
+      backendLabel: backend?.label || null,
+      reason: enabled
+        ? this.reason || ''
+        : 'Audio is disabled on this server (AUDIO_ENABLED=0 or AUDIO_SOURCE=off).',
+      bitrateKbps: this.config.audioBitrateKbps,
+      listeners: this.sockets.size,
+      platform: process.platform,
+      perSession: this.hub.perSession,
+      isolated: Boolean(this.hub.sinkFor(this.key)),
+    };
+  }
+
+  /** The ffmpeg input for this session, or null when capture is impossible. */
   resolveBackend() {
-    if (this.backend) return this.backend;
-    if (!this.enabled) return null;
-    const source = this.config.audioSource;
+    const kind = this.hub.backendKind;
     const device = this.config.audioDevice;
-    const input = (kind, target) => (kind === 'dshow' ? ['-f', 'dshow', '-i', `audio=${target}`] : ['-f', kind, '-i', target]);
-
-    const dshow = () => {
-      if (!device) {
-        this.reason = 'AUDIO_DEVICE must name a Windows audio capture device (Stereo Mix, VB-Cable Output, …).';
-        return null;
-      }
-      this.backend = { id: 'dshow', label: `DirectShow · ${device}`, input: input('dshow', device) };
-      return this.backend;
-    };
-
-    const pulse = () => {
-      const target = device || 'default';
-      this.backend = { id: 'pulse', label: `PulseAudio · ${target}`, input: ['-f', 'pulse', '-i', target] };
-      return this.backend;
-    };
-
-    if (source === 'tone') {
-      this.backend = {
+    if (!kind) {
+      this.reason = this.hub.enabled
+        ? 'No audio capture device is available on this server.'
+        : 'Audio is disabled on this server (AUDIO_ENABLED=0 or AUDIO_SOURCE=off).';
+      return null;
+    }
+    if (kind === 'tone') {
+      return {
         id: 'tone',
         label: 'Generated test tone (440 Hz)',
         input: ['-re', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000'],
       };
-      return this.backend;
     }
-    if (source === 'dshow') return dshow();
-    if (source === 'pulse') return pulse();
-
-    if (process.platform === 'win32') {
-      if (device) return dshow();
-      this.reason =
-        'No audio capture device configured. Set AUDIO_DEVICE to a Windows loopback device, or AUDIO_SOURCE=tone to test the audio transport.';
-      return null;
+    if (kind === 'dshow') {
+      if (!device) {
+        this.reason = 'AUDIO_DEVICE must name a Windows audio capture device (Stereo Mix, VB-Cable Output, …).';
+        return null;
+      }
+      return { id: 'dshow', label: `DirectShow · ${device}`, input: ['-f', 'dshow', '-i', `audio=${device}`] };
     }
-    if (process.platform === 'linux') return pulse();
-    this.reason = `Audio capture is not implemented for ${process.platform}.`;
-    return null;
+    const sink = this.hub.sinkFor(this.key);
+    const target = sink ? `${sink}.monitor` : device || 'default';
+    return { id: 'pulse', label: `PulseAudio · ${target}`, input: ['-f', 'pulse', '-i', target] };
   }
 
   setStatus(status, reason = this.reason) {
@@ -110,8 +281,12 @@ export class AudioService {
     this.broadcastStatus();
   }
 
+  statusPayload() {
+    return JSON.stringify({ t: 'audio:status', ...this.info() });
+  }
+
   broadcastStatus() {
-    const payload = JSON.stringify({ t: 'audio:status', ...this.info() });
+    const payload = this.statusPayload();
     for (const ws of this.sockets) {
       try {
         if (ws.readyState === 1) ws.send(payload);
@@ -121,22 +296,23 @@ export class AudioService {
     }
   }
 
+  sendStatus(ws) {
+    try {
+      if (ws.readyState === 1) ws.send(this.statusPayload());
+    } catch {
+      /* closing */
+    }
+  }
+
   attach(ws) {
     this.sockets.add(ws);
     ws.synced = false;
     ws.carry = null;
     clearTimeout(this.stopTimer);
     this.stopTimer = null;
-    const sendStatus = () => {
-      try {
-        if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'audio:status', ...this.info() }));
-      } catch {
-        /* closing */
-      }
-    };
-    sendStatus();
+    this.sendStatus(ws);
     this.start()
-      .then(sendStatus)
+      .then(() => this.sendStatus(ws))
       .catch((error) => log.debug('audio start failed', error.message));
 
     ws.on('close', () => {
@@ -161,7 +337,7 @@ export class AudioService {
   }
 
   async start() {
-    if (!this.enabled) return this.info();
+    if (!this.hub.enabled) return this.info();
     if (this.proc) return this.info();
     if (this.starting) {
       await this.starting;
@@ -177,14 +353,20 @@ export class AudioService {
   }
 
   async launch() {
-    if (!(await this.ffmpegAvailable())) {
+    if (!(await this.hub.ffmpegAvailable())) {
       this.setStatus('unavailable', `ffmpeg was not found (${this.config.audioFfmpegPath}). Install ffmpeg to enable audio.`);
       return;
     }
+    // The sink must exist before Chromium is launched and before ffmpeg reads it.
+    if (this.hub.perSession) await this.hub.prepareSink(this.key);
     const backend = this.resolveBackend();
     if (!backend) {
       this.setStatus('unavailable', this.reason || 'No audio capture device is available on this server.');
       return;
+    }
+    this.backend = backend;
+    if (this.hub.perSession && backend.id === 'pulse' && !this.hub.sinkFor(this.key)) {
+      log.warn('Audio for this session is sharing the default sink because its own sink is unavailable');
     }
 
     const args = [

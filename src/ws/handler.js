@@ -51,12 +51,13 @@ export function attachWebSocketServer(server, { auth, manager, limiter, audio })
   const wss = new WebSocketServer({ noServer: true, maxPayload: 512 * 1024, perMessageDeflate: false });
   const audioWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false });
 
-  audioWss.on('connection', (ws) => {
+  audioWss.on('connection', (ws, req, body) => {
     if (!audio) {
       ws.close(1011, 'Audio unavailable');
       return;
     }
-    audio.attach(ws);
+    // The capture belongs to the signed-in session, never to the socket alone.
+    audio.attach(body?.id || 'local-development', ws);
     ws.on('message', (raw, isBinary) => {
       if (isBinary) return;
       try {
@@ -339,6 +340,24 @@ async function handle(client, workspace, message) {
         width: record.session.viewport.width,
         height: record.session.viewport.height,
       });
+      return;
+    }
+
+    case 'stream': {
+      if (!client.tabId) return;
+      const record = workspace.getRecord(client.tabId);
+      if (!record?.session) return;
+      const active = message.active !== false;
+      await record.session.setStreamingActive(active);
+      client.send({ t: 'stream', tabId: record.id, active });
+      return;
+    }
+
+    case 'screenshot': {
+      const { session, record } = await requireLive();
+      if (!session) return;
+      const data = await session.captureScreenshot();
+      if (data) client.send({ t: 'screenshot', tabId: record.id, data });
       return;
     }
 

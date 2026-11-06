@@ -38,6 +38,11 @@ You can drop the proxy into any page with an iframe:
 ></iframe>
 ```
 
+A page opened straight from disk (`file:///…/page.html`) needs the scheme listed explicitly, because
+CSP's `*` never matches non-network schemes: set `FRAME_ANCESTORS=* file:`. Cookies and the
+WebSocket then behave exactly as they do for a hosted page, since the frame itself is still served
+over HTTPS.
+
 The shell sends `Content-Security-Policy: frame-ancestors *` and no `X-Frame-Options`, so it can be
 framed by any origin (`FRAME_ANCESTORS=https://your-site.example` narrows this, `FRAME_ANCESTORS=none`
 brings back `DENY`). Over HTTPS the session cookie is issued as `SameSite=None; Secure`, which is what
@@ -57,10 +62,17 @@ top-level page's address bar is never touched.
 - Sessions survive a page refresh: the server persists tabs and the active tab id, and the client
   reattaches over the WebSocket — the URL stays on the root path.
 
-**New tab page**
-Dark glass UI with a clock/greeting, centered search, engine chip (Google, DuckDuckGo, Bing,
-Brave, Startpage or a custom `%s` template), editable shortcut tiles, recent and frequently
-visited sites, add/edit/remove shortcuts, light/dark theme, responsive down to phone widths.
+**Interface**
+A quiet, typographic shell — hairline surfaces, one warm accent, a serif greeting — with a centered
+search and engine chip (Google, DuckDuckGo, Bing, Brave, Startpage or a custom `%s` template),
+editable shortcut tiles, a **Continue** row of the tabs you still have open, history grouped by day,
+frequent-site chips, add/edit/remove shortcuts, light/dark theme and layouts that hold down to phone
+widths. `Ctrl+K` opens a command palette over open tabs, history, shortcuts and browser commands;
+a toolbar activity panel (`/api/stats`) shows server memory, live browsers and pages against their
+caps, sessions, audio streams and uptime, and releases idle Chromium processes on demand
+(`/api/reclaim`). Browsing adds page zoom (`Ctrl` +/-/`0`, a real reflow of the remote page),
+fullscreen (`F11`, or a button), a screenshot capture that saves the remote page as JPEG, and
+automatic edge-to-edge layout when a page enters HTML fullscreen.
 
 **Rendering**
 Per-tab `BrowserContext` (isolated cookies, localStorage, cache, permissions), CDP
@@ -68,10 +80,11 @@ Per-tab `BrowserContext` (isolated cookies, localStorage, cache, permissions), C
 cancelled.
 
 **Audio**
-Chromium's output is captured with ffmpeg (PulseAudio/PipeWire monitor on Linux, DirectShow loopback
-on Windows), encoded to WebM/Opus and streamed over `/ws/audio`; the client plays it through Media
-Source Extensions. Audio starts on the first interaction (autoplay-safe) with a clear prompt if the
-browser blocks it. The toolbar has a global mute button, each tab has its own mute button and an
+Each signed-in session gets its own Chromium process and its own PulseAudio null sink, captured by its
+own ffmpeg instance (DirectShow loopback on Windows), encoded to WebM/Opus and streamed over
+`/ws/audio`; the client plays it through Media Source Extensions. Audio is therefore per person: two
+visitors never hear each other's tabs. Audio starts on the first interaction (autoplay-safe) with a
+clear prompt if the browser blocks it. The toolbar has a global mute button, each tab has its own mute button and an
 indicator when it is producing sound, the settings drawer has a volume slider and audio status, and
 inactive tabs are muted inside the page so streams never leak between tabs. Capture stops after the
 last listener disconnects and when a tab closes.
@@ -201,6 +214,12 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `ALLOW_NO_AUTH` | `0` | Explicit opt-in for an unauthenticated proxy; refused on public interfaces. |
 | `MAX_TABS` / `MAX_SESSIONS` | `12` / `40` | Per user / global live Chromium contexts. |
 | `TAB_IDLE_MINUTES` | `10` | Idle tabs are suspended (state saved, context closed). |
+| `BROWSER_IDLE_SECONDS` | `180` | A session with no connected visitor loses its Chromium process, audio sink and ffmpeg after this long; tabs reload on reconnect. |
+| `MAX_LIVE_BROWSERS` | `6` | Cap on concurrent Chromium processes. Only sessions with no connected visitor are evicted, least recently active first. |
+| `MAX_LIVE_TABS` | `16` | Cap on live pages across all sessions; the least recently used tab without viewers is suspended. |
+| `SCREENCAST_FPS` | `30` | Maximum frames pushed to viewers per second; extra captures are dropped before packetising. |
+| `IDLE_POLL_MS` | `5000` | Page polling interval for tabs nobody is watching; `1100` while watched. |
+| `CHROMIUM_JS_HEAP_MB` | `512` | V8 old-space cap per renderer, so one heavy page cannot grow without bound. `0` keeps Chromium's default. |
 | `NAV_TIMEOUT_MS` | `45000` | Navigation timeout. |
 | `FRAME_QUALITY` | `62` | Initial JPEG quality (1–90), adapts to back-pressure. |
 | `VIEWPORT_MAX_WIDTH/HEIGHT` | `1920` / `1200` | Caps for the remote viewport. |
@@ -214,7 +233,9 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `AUDIO_FFMPEG_PATH` | `ffmpeg` | ffmpeg binary (needs libopus). |
 | `AUDIO_BITRATE_KBPS` | `64` | Opus bitrate, 24–160. |
 | `AUDIO_PULSE_SERVER` / `AUDIO_PULSE_SINK` | – | PulseAudio server/sink for Chromium's output. |
-| `FRAME_ANCESTORS` | `*` | CSP `frame-ancestors`: who may embed the shell. `none` sends `X-Frame-Options: DENY`. |
+| `AUDIO_PER_SESSION` | `1` | One browser process, sink and capture per session (per-person audio). `0` shares one capture to save RAM. |
+| `AUDIO_PACTL_PATH` | `pactl` | Used to create and unload the per-session sinks. |
+| `FRAME_ANCESTORS` | `*` | CSP `frame-ancestors`: who may embed the shell. Add `file:` for local HTML pages. `none` sends `X-Frame-Options: DENY`. |
 | `EMBED_PARTITIONED_COOKIES` | `0` | Use partitioned cookies (CHIPS) for third-party-iframe sessions. |
 | `SSRF_GUARD` | `routes` | `routes` inspects every request; `nav` only top-level navigations. |
 | `ALLOW_PRIVATE_TARGETS` | `0` | Development only: allow loopback/private destinations. |
@@ -250,17 +271,20 @@ journalctl -u velocity-proxy -f
   `tab:activate`, …). The server stores `activeTabId` next to the tab list in the workspace file and
   returns it from `/api/session`; the client never writes the address bar, and legacy `/b/*`,
   `/tab/*` and `/browser/*` links are redirected to `/`.
-- **Tabs.** `WorkspaceManager` launches one Chromium process per workspace and creates one
-  `BrowserContext` per tab. Each tab keeps its own URL/title/loading/pinned/muted state in
+- **Tabs.** `WorkspaceManager` launches one Chromium process per workspace (when per-session audio is
+  on) and creates one `BrowserContext` per tab. Each tab keeps its own URL/title/loading/pinned/muted state in
   `DATA_DIR/workspaces/<id>.json`; cookies and localStorage are saved with Playwright
   `storageState` so a suspended or restarted tab resumes signed in.
-- **Audio.** Chromium launches without Playwright's `--mute-audio` and plays into a PulseAudio null
-  sink (or a DirectShow loopback device). `AudioService` runs ffmpeg (`-f pulse -i
-  velocity_sink.monitor -c:a libopus -f webm`) and broadcasts the same WebM/Opus stream to every
-  `/ws/audio` client, dropping frames when a socket is backpressured. Capture starts on the first
-  listener, stops 12 s after the last one leaves, and is capped at 64 kbps by default. Only the
-  active tab is unmuted: `TabSession.setMuted()` mutes every `audio`/`video` element in the page
-  (and re-applies it on play), so background tabs stay silent without a per-tab mixer.
+- **Audio.** Chromium launches without Playwright's `--mute-audio`. With `AUDIO_PER_SESSION=1`
+  (default) every workspace gets its own Chromium process launched with `PULSE_SINK=velocity_<hash>`;
+  the sink is created on demand with `pactl` and removed when the browser closes. `AudioService` runs
+  one ffmpeg per session (`-f pulse -i velocity_<hash>.monitor -c:a libopus -f webm`) and sends that
+  stream only to `/ws/audio` sockets carrying the same session, so each visitor hears their own
+  tabs. Frames are dropped when a socket is backpressured; capture starts on the first listener and
+  stops 12 s after the last one leaves (capped at 64 kbps). Without `pactl`, on Windows DirectShow,
+  or with `AUDIO_PER_SESSION=0`, one shared capture is used instead. Only the active tab is unmuted:
+  `TabSession.setMuted()` mutes every `audio`/`video` element in the page (and re-applies it on
+  play), so background tabs stay silent without a per-tab mixer.
 - **Frames.** The active tab runs `Page.startScreencast`; frames are packed as
   `magic "VXFP" (0x56584650) | version 1 | id length | tab id | JPEG` and sent over the tab's single
   WebSocket. The client decodes with `createImageBitmap` and draws to canvas; only the active tab
@@ -280,22 +304,26 @@ journalctl -u velocity-proxy -f
 ## Verification
 
 `npm run smoke` boots the real server with a throwaway data dir, a local target site and
-`AUDIO_SOURCE=tone`, then drives the HTTP + WebSocket protocol end to end. It covers 28 assertions:
+`AUDIO_SOURCE=tone`, then drives the HTTP + WebSocket protocol end to end. It covers 32 assertions:
 unauthenticated API/WS refusal, the `SameSite=None; Secure` login cookie, root SPA route,
 `frame-ancestors *` / no `X-Frame-Options` / `autoplay=*` (iframe embedding), legacy tab-path
 redirects, favicon
 SSRF refusal, real Chromium render + binary frames, title/URL tracking, navigation and
 back/forward, search expansion, text and key input reaching the remote DOM, tab
 pin/duplicate/close, `activeTabId` persistence, per-tab mute round-trip, a live Opus/WebM audio
-stream (ffmpeg → socket → EBML header), refusal of unauthenticated audio sockets, the absence of
+stream (ffmpeg → socket → EBML header), a separate capture for each session, refusal of
+unauthenticated audio sockets, a screencast that stops receiving frames while the viewer reports it
+is hidden and resumes on return, the auth-guarded `/api/stats` snapshot, cross-origin refusal on
+`/api/reclaim`, the absence of
 iframes/`window.open`/`history.pushState` in the client sources, SSRF unit checks and URL detection.
-The suite passed 28/28 on this machine (Chromium 156 headless, Node 22, ffmpeg 8.0.1).
+The suite passed 32/32 on this machine (Chromium 156 headless, Node 22, ffmpeg 8.0.1).
 
 Manual checks against the live UI (same build):
 
 | Check | Result |
 | --- | --- |
 | Homepage, engine chip, shortcuts, recent/frequent, theme, settings | Rendered; suggestions and history populate |
+| Command palette, activity panel | `Ctrl+K` searches tabs/history and runs commands; the panel reports live counters |
 | `example.com`, `en.wikipedia.org`, `youtube.com`, `tiktok.com` | Rendered inside the canvas with correct titles/hosts |
 | URL bar stays on the proxy | `location.pathname` stayed `/` through create, navigate, switch, refresh and close |
 | No iframes anywhere | `document.querySelectorAll('iframe').length === 0` in the shell |
@@ -333,6 +361,10 @@ should be exercised on a throwaway VPS before production.
   automated browsers outright.
 - **No browser extensions, DevTools, passkeys/WebAuthn, or native print dialogs.**
 - Tabs are per user and capped (`MAX_TABS`, `MAX_SESSIONS`); heavy video tabs cost real CPU/RAM.
+- Idle work is capped too: `MAX_LIVE_BROWSERS` / `MAX_LIVE_TABS` bound how many Chromium
+  processes and pages exist at once, `BROWSER_IDLE_SECONDS` frees a disconnected session's browser,
+  `SCREENCAST_FPS` limits frame encoding, and unwatched tabs are polled every `IDLE_POLL_MS`
+  instead of every 1.1 s.
 - The UI ships as ES modules without a build step; a hard refresh may be needed after upgrading a
   running instance (assets are served `Cache-Control: no-cache` and revalidate by ETag).
 

@@ -21,10 +21,14 @@ const TAB_ID_PATTERN = /^[a-f0-9]{8,40}$/;
 const HISTORY_LIMIT = 200;
 
 export class WorkspaceManager {
-  constructor(config) {
+  constructor(config, { audio = null } = {}) {
     this.config = config;
-    this.browser = null;
-    this.launching = null;
+    this.audio = audio;
+    // Per-session audio needs a Chromium process per workspace, because Chromium
+    // picks its audio device (PULSE_SINK) when the process starts.
+    this.shared = { browser: null, launching: null };
+    this.browsers = new Map();
+    this.browserVersion = null;
     this.workspaces = new Map();
     this.pending = new Map();
     this.pageOwners = new Map();
@@ -34,39 +38,124 @@ export class WorkspaceManager {
     this.cleaning = false;
     this.stopping = false;
     this.sandboxDisabled = false;
-    this.maxLiveTabs = Math.max(8, Math.min(64, Math.ceil(config.maxSessions * 1.5)));
+    this.maxLiveTabs = config.maxLiveTabs;
+  }
+
+  get perSessionAudio() {
+    return Boolean(this.audio?.perSession);
+  }
+
+  /** The browser used for status checks and logs. */
+  get browser() {
+    if (this.shared.browser) return this.shared.browser;
+    for (const entry of this.browsers.values()) {
+      if (entry.browser) return entry.browser;
+    }
+    return null;
   }
 
   async start() {
-    await this.ensureBrowser();
+    if (this.perSessionAudio) {
+      log.info('Per-session audio: each signed-in visitor gets a Chromium process and audio sink');
+    } else {
+      await this.ensureBrowser();
+    }
     this.cleanupTimer = setInterval(() => {
       this.cleanup().catch((error) => log.debug('cleanup failed', error.message));
     }, 60_000);
     this.cleanupTimer.unref?.();
   }
 
-  async ensureBrowser() {
-    if (this.browser && this.browser.isConnected()) return this.browser;
+  async ensureBrowser(workspace = null) {
     if (this.stopping) throw new Error('Proxy is shutting down');
-    if (this.launching) return this.launching;
-    this.launching = this.launchBrowser()
+
+    if (!this.perSessionAudio) {
+      if (this.shared.browser?.isConnected()) return this.shared.browser;
+      if (this.shared.launching) return this.shared.launching;
+      this.shared.launching = this.launchBrowser(null)
+        .then((browser) => {
+          this.shared.browser = browser;
+          browser.on('disconnected', () => {
+            if (this.stopping) return;
+            log.warn('Chromium disconnected - sessions will be recreated on demand');
+            this.shared.browser = null;
+            for (const candidate of this.workspaces.values()) candidate.handleBrowserDisconnect();
+          });
+          return browser;
+        })
+        .finally(() => {
+          this.shared.launching = null;
+        });
+      return this.shared.launching;
+    }
+
+    const key = workspace.key;
+    let entry = this.browsers.get(key);
+    if (entry?.browser?.isConnected()) return entry.browser;
+    if (entry?.launching) return entry.launching;
+
+    await this.enforceBrowserLimit();
+    const sink = await this.audio.prepareSink(key);
+    entry = entry || { workspace, browser: null, launching: null };
+    this.browsers.set(key, entry);
+    entry.launching = this.launchBrowser(sink)
       .then((browser) => {
-        this.browser = browser;
+        entry.browser = browser;
         browser.on('disconnected', () => {
           if (this.stopping) return;
-          log.warn('Chromium disconnected - sessions will be recreated on demand');
-          this.browser = null;
-          for (const workspace of this.workspaces.values()) workspace.handleBrowserDisconnect();
+          log.warn('Chromium for a session disconnected - its tabs will be recreated on demand');
+          entry.browser = null;
+          entry.workspace.handleBrowserDisconnect();
         });
         return browser;
       })
+      .catch((error) => {
+        if (this.browsers.get(key) === entry) this.browsers.delete(key);
+        throw error;
+      })
       .finally(() => {
-        this.launching = null;
+        entry.launching = null;
       });
-    return this.launching;
+    return entry.launching;
   }
 
-  async launchBrowser() {
+  /**
+   * Keeps the number of Chromium processes bounded. Only browsers whose
+   * workspace has no connected client are evicted (least recently active
+   * first), so someone who is actually watching is never kicked.
+   */
+  async enforceBrowserLimit() {
+    if (!this.perSessionAudio) return;
+    const limit = Math.max(1, this.config.maxLiveBrowsers);
+    if (this.browsers.size < limit) return;
+    const excess = this.browsers.size - limit + 1;
+    const candidates = [...this.browsers.values()]
+      .filter((entry) => entry.workspace.clients.size === 0)
+      .sort((a, b) => a.workspace.lastActiveAt - b.workspace.lastActiveAt)
+      .slice(0, excess);
+    if (!candidates.length) return;
+    for (const entry of candidates) {
+      for (const record of entry.workspace.records.values()) {
+        if (record.session) await entry.workspace.suspend(record).catch(() => {});
+      }
+      await this.releaseBrowser(entry.workspace).catch(() => {});
+      log.debug('evicted idle Chromium to stay within MAX_LIVE_BROWSERS');
+    }
+  }
+
+  /** Closes a workspace's browser (and its audio sink) when nothing needs it. */
+  async releaseBrowser(workspace) {
+    if (!this.perSessionAudio) return;
+    const entry = this.browsers.get(workspace.key);
+    if (!entry) return;
+    this.browsers.delete(workspace.key);
+    if (entry.launching) await entry.launching.catch(() => {});
+    if (entry.browser) await entry.browser.close().catch(() => {});
+    entry.browser = null;
+    this.audio?.releaseSession(workspace.key);
+  }
+
+  async launchBrowser(sink) {
     const headless = this.config.browserMode === 'headless';
     const args = [
       '--disable-dev-shm-usage',
@@ -79,6 +168,23 @@ export class WorkspaceManager {
       '--disable-blink-features=AutomationControlled',
       '--font-render-hinting=none',
       '--lang=en-US',
+      // Bounded disk/media cache: a shared proxy should not let a few heavy
+      // sites grow the cache directory without limit.
+      '--disk-cache-size=33554432',
+      '--media-cache-size=4194304',
+      // A server browser has no user to serve these services to; they only cost
+      // idle CPU, memory and traffic.
+      '--disable-background-networking',
+      '--disable-component-update',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--disable-breakpad',
+      '--no-pings',
+      '--metrics-recording-only',
+      '--disable-features=Translate,MediaRouter,OptimizationHints',
+      ...(this.config.chromiumJsHeapMb > 0
+        ? [`--js-flags=--max-old-space-size=${this.config.chromiumJsHeapMb}`]
+        : []),
       ...this.config.chromiumArgs,
     ];
     const base = {
@@ -92,7 +198,9 @@ export class WorkspaceManager {
         ...process.env,
         LANG: 'en_US.UTF-8',
         ...(this.config.audioPulseServer ? { PULSE_SERVER: this.config.audioPulseServer } : {}),
-        ...(this.config.audioPulseSink ? { PULSE_SINK: this.config.audioPulseSink } : {}),
+        ...((sink || this.config.audioPulseSink)
+          ? { PULSE_SINK: sink || this.config.audioPulseSink }
+          : {}),
       },
     };
 
@@ -101,6 +209,7 @@ export class WorkspaceManager {
 
     const attempt = async (sandbox) => {
       const browser = await chromium.launch({ ...base, chromiumSandbox: sandbox });
+      this.browserVersion = browser.version();
       log.info(`Chromium launched (${headless ? 'headless' : 'headed'}, sandbox ${sandbox ? 'on' : 'off'}, version ${browser.version()})`);
       if (!sandbox) this.sandboxDisabled = true;
       return browser;
@@ -116,7 +225,7 @@ export class WorkspaceManager {
   }
 
   async createContext(workspace, { storageState } = {}) {
-    const browser = await this.ensureBrowser();
+    const browser = await this.ensureBrowser(workspace);
     const viewport = { width: 1280, height: 800 };
     const context = await browser.newContext({
       viewport,
@@ -245,7 +354,18 @@ export class WorkspaceManager {
             }
           }
         }
+        // A per-session Chromium is expensive: once nobody is connected, suspend
+        // the pages (their cookies/URLs are persisted) and stop the process.
+        if (now - workspace.lastActiveAt > this.config.browserIdleMs) {
+          for (const record of workspace.records.values()) {
+            if (record.session) await workspace.suspend(record).catch(() => {});
+          }
+        }
+        if (![...workspace.records.values()].some((record) => record.session)) {
+          await this.releaseBrowser(workspace).catch(() => {});
+        }
         if (now - workspace.lastActiveAt > 7 * 24 * 60 * 60 * 1000) {
+          await this.releaseBrowser(workspace).catch(() => {});
           await workspace.dispose().catch(() => {});
           this.workspaces.delete(key);
         }
@@ -255,6 +375,7 @@ export class WorkspaceManager {
           .filter((workspace) => workspace.clients.size === 0)
           .sort((a, b) => a.lastActiveAt - b.lastActiveAt);
         for (const workspace of idle.slice(0, this.workspaces.size - this.config.maxSessions)) {
+          await this.releaseBrowser(workspace).catch(() => {});
           await workspace.dispose().catch(() => {});
           this.workspaces.delete(workspace.key);
         }
@@ -264,6 +385,36 @@ export class WorkspaceManager {
     }
   }
 
+  /** Snapshot for the activity panel: counts only, no expensive work. */
+  stats() {
+    const perSession = Boolean(this.perSessionAudio);
+    return {
+      sessions: this.workspaces.size,
+      liveBrowsers: perSession ? this.browsers.size : this.shared.browser?.isConnected() ? 1 : 0,
+      maxLiveBrowsers: perSession ? Math.max(1, this.config.maxLiveBrowsers) : 1,
+      liveTabs: this.liveTabCount(),
+      maxLiveTabs: this.maxLiveTabs,
+      perSessionAudio: perSession,
+    };
+  }
+
+  /** Frees Chromium processes (and their audio sinks) for sessions nobody is watching. */
+  async reclaimIdle() {
+    let released = 0;
+    for (const workspace of this.workspaces.values()) {
+      if (workspace.clients.size > 0) continue;
+      const entry = this.browsers.get(workspace.key);
+      if (!entry) continue;
+      for (const record of workspace.records.values()) {
+        if (record.session) await workspace.suspend(record).catch(() => {});
+      }
+      const hadBrowser = Boolean(entry.browser);
+      await this.releaseBrowser(workspace).catch(() => {});
+      if (hadBrowser) released += 1;
+    }
+    return released;
+  }
+
   async stop() {
     this.stopping = true;
     clearInterval(this.cleanupTimer);
@@ -271,9 +422,14 @@ export class WorkspaceManager {
       await workspace.dispose().catch(() => {});
     }
     this.workspaces.clear();
-    if (this.browser) {
-      await this.browser.close().catch(() => {});
-      this.browser = null;
+    for (const entry of this.browsers.values()) {
+      if (entry.launching) await entry.launching.catch(() => {});
+      if (entry.browser) await entry.browser.close().catch(() => {});
+    }
+    this.browsers.clear();
+    if (this.shared.browser) {
+      await this.shared.browser.close().catch(() => {});
+      this.shared.browser = null;
     }
   }
 }
@@ -576,6 +732,7 @@ class Workspace {
     });
     session.on('visited', (visit) => this.addHistory(visit));
     session.on('dialog', (dialog) => this.broadcast({ t: 'dialog', dialog }));
+    session.on('fullscreen', (on) => this.broadcast({ t: 'fullscreen', tabId: record.id, on }));
     session.on('closed', (reason) => {
       if (record.session !== session) return;
       record.session = null;

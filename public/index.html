@@ -62,6 +62,8 @@
           </form>
 
           <div class="toolbar-actions">
+            <button class="icon-btn" id="activity-btn" type="button" aria-label="Activity" title="Activity"></button>
+            <button class="icon-btn" id="fullscreen-btn" type="button" aria-label="Fullscreen" title="Fullscreen (F11)"></button>
             <button class="icon-btn" id="audio-btn" type="button" aria-label="Audio" title="Audio"></button>
             <button class="icon-btn" id="bookmark" type="button" aria-label="Bookmark" title="Bookmark this page"></button>
             <button class="icon-btn" id="copy-url" type="button" aria-label="Copy destination URL" title="Copy destination URL"></button>
@@ -72,9 +74,6 @@
 
       <main class="viewport" id="viewport">
         <section class="newtab" id="newtab" aria-label="New tab page">
-          <div class="nt-glow nt-glow-a"></div>
-          <div class="nt-glow nt-glow-b"></div>
-          <div class="nt-grid"></div>
           <div class="nt-inner">
             <header class="nt-top">
               <div class="nt-brand" id="nt-brand"></div>
@@ -85,9 +84,7 @@
             </header>
 
             <div class="nt-hero">
-              <p class="nt-eyebrow" id="greeting">Good evening</p>
-              <h1 class="nt-headline">Where to next?</h1>
-              <p class="nt-sub">A real Chromium browser runs on the server. You stay right here.</p>
+              <h1 class="nt-headline" id="greeting">Good evening.</h1>
 
               <form class="nt-search" id="nt-search" autocomplete="off">
                 <button class="engine-chip" id="engine-chip" type="button" aria-label="Choose search engine">
@@ -108,12 +105,16 @@
                 <div class="suggest-panel nt-suggest" id="nt-suggest"></div>
               </form>
 
-              <div class="nt-trust">
-                <span class="trust-pill"><i class="trust-dot"></i>Session isolated</span>
-                <span class="trust-pill"><i class="trust-dot"></i>No iframes</span>
-                <span class="trust-pill"><i class="trust-dot"></i>SSRF guarded</span>
-              </div>
+              <p class="nt-hint"><kbd>Ctrl</kbd><kbd>K</kbd> for tabs, history and commands</p>
             </div>
+
+            <section class="nt-section" id="continue-section" hidden>
+              <div class="nt-section-head">
+                <h2>Continue</h2>
+                <span class="nt-count" id="continue-count"></span>
+              </div>
+              <div class="continue-list" id="continue"></div>
+            </section>
 
             <section class="nt-section">
               <div class="nt-section-head">
@@ -124,17 +125,20 @@
 
             <div class="nt-columns">
               <section class="nt-section">
-                <div class="nt-section-head"><h2>Recently visited</h2></div>
+                <div class="nt-section-head">
+                  <h2>Recent activity</h2>
+                  <span class="nt-count" id="recent-count"></span>
+                </div>
                 <ul class="site-list" id="recent"></ul>
               </section>
               <section class="nt-section">
-                <div class="nt-section-head"><h2>Frequently visited</h2></div>
-                <ul class="site-list" id="frequent"></ul>
+                <div class="nt-section-head"><h2>Frequent</h2></div>
+                <div class="freq-chips" id="frequent"></div>
               </section>
             </div>
 
             <footer class="nt-footer">
-              <span>Rendered live by server-side Chromium · every request stays on this origin</span>
+              <span>Server-side Chromium · streamed over WebSocket</span>
               <span class="nt-kbd"><kbd>Ctrl</kbd><kbd>T</kbd> new tab <kbd>Ctrl</kbd><kbd>L</kbd> address bar <kbd>Alt</kbd><kbd>←</kbd> back</span>
             </footer>
           </div>
@@ -254,7 +258,6 @@
       </div>
 
       <div class="modal-layer login-layer" id="login" hidden>
-        <div class="login-aurora"></div>
         <div class="login-card">
           <div class="login-brand" id="login-brand"></div>
           <h1>Sign in</h1>
@@ -299,6 +302,46 @@
             <button class="btn ghost" id="dialog-cancel" type="button">Cancel</button>
             <button class="btn primary" id="dialog-ok" type="button">OK</button>
           </div>
+        </div>
+      </div>
+
+      <div class="palette-layer" id="palette-layer" hidden>
+        <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+          <div class="palette-bar">
+            <span class="palette-mark" id="palette-mark"></span>
+            <input
+              class="palette-input"
+              id="palette-input"
+              type="text"
+              placeholder="Search tabs, history or run a command"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              aria-label="Command palette"
+            />
+            <kbd>esc</kbd>
+          </div>
+          <div class="palette-results" id="palette-results" role="listbox" aria-label="Results"></div>
+          <footer class="palette-foot">
+            <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+            <span><kbd>↵</kbd> run</span>
+            <span id="palette-foot-hint"></span>
+          </footer>
+        </div>
+      </div>
+
+      <div class="modal-layer" id="system-modal" hidden>
+        <div class="modal-card system-card" role="dialog" aria-modal="true" aria-label="Activity">
+          <div class="system-head">
+            <div>
+              <h2>Activity</h2>
+              <p class="modal-sub">Live resources for this proxy.</p>
+            </div>
+            <button class="icon-btn" id="system-close" type="button" aria-label="Close Activity">&times;</button>
+          </div>
+          <dl class="system-grid" id="system-grid"></dl>
+          <button class="btn ghost block" id="system-reclaim" type="button">Release idle browsers</button>
+          <p class="settings-note" id="system-note">Browsers with no connected visitor are released automatically.</p>
         </div>
       </div>
     </div>

@@ -16,8 +16,8 @@ import { delay } from './util.js';
 
 const auth = new AuthService();
 const limiter = new RateLimiter();
-const manager = new WorkspaceManager(config);
 const audio = new AudioService(config);
+const manager = new WorkspaceManager(config, { audio });
 const app = express();
 
 app.disable('x-powered-by');
@@ -142,7 +142,7 @@ app.get('/api/session', async (req, res, next) => {
       version: config.version,
       tabs: workspace.list(),
       activeTabId: workspace.activeRecordId,
-      audio: audio.info(),
+      audio: audio.info(req.workspaceKey),
       history: workspace.historySnapshot(),
       limits: { maxTabs: config.maxTabs, frameQuality: config.frameQuality },
       engines: Object.entries(ENGINES).map(([id, engine]) => ({ id, name: engine.name, search: engine.search })),
@@ -153,7 +153,39 @@ app.get('/api/session', async (req, res, next) => {
 });
 
 app.get('/api/audio', (req, res) => {
-  res.json({ ok: true, ...audio.info() });
+  res.json({ ok: true, ...audio.info(req.workspaceKey) });
+});
+
+app.get('/api/stats', (req, res) => {
+  const usage = process.memoryUsage();
+  res.json({
+    ok: true,
+    version: config.version,
+    uptime: Math.round(process.uptime()),
+    process: {
+      rssMb: Math.round(usage.rss / 1048576),
+      heapMb: Math.round(usage.heapUsed / 1048576),
+      externalMb: Math.round(usage.external / 1048576),
+    },
+    resources: manager.stats(),
+    audio: { streams: audio.streamCount, status: audio.overallStatus() },
+    limits: {
+      maxTabs: config.maxTabs,
+      maxSessions: config.maxSessions,
+      browserIdleSeconds: Math.round(config.browserIdleMs / 1000),
+    },
+  });
+});
+
+app.post('/api/reclaim', async (req, res, next) => {
+  if (!AuthService.isSameOrigin(req)) return res.status(403).json({ error: 'Cross-origin request rejected' });
+  try {
+    const released = await manager.reclaimIdle();
+    if (released) log.info(`released ${released} idle browser${released === 1 ? '' : 's'}`);
+    res.json({ ok: true, released });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/api/history', async (req, res, next) => {
@@ -228,9 +260,10 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     uptime: Math.round(process.uptime()),
-    browser: manager.browser?.isConnected() ? 'ready' : 'starting',
+    browser: manager.browser?.isConnected() ? 'ready' : manager.perSessionAudio ? 'per-session' : 'starting',
     sandbox: manager.sandboxDisabled ? 'disabled' : 'enabled',
-    audio: audio.info().status,
+    audio: audio.overallStatus(),
+    audioStreams: audio.streamCount,
     version: config.version,
   });
 });
@@ -299,7 +332,9 @@ process.on('uncaughtException', (error) => log.error('uncaught exception', error
 const banner = () => {
   const origin = config.publicOrigin || `http://${config.host}:${config.port}`;
   log.info(`${config.appName} v${config.version} listening on ${origin}`);
-  log.info(`Browser engine: ${manager.browser?.version() || 'unknown'} (${config.browserMode})`);
+  log.info(
+    `Browser engine: ${manager.browserVersion || 'per-session, launched on first tab'} (${config.browserMode})`,
+  );
   if (config.authMode === 'none') {
     log.warn('AUTH_MODE=none - anyone who can reach this port can use the proxy');
   } else if (config.generatedPassword) {

@@ -99,6 +99,16 @@ const siteServer = http.createServer((req, res) => {
     );
     return;
   }
+  if (pathname === '/motion') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(
+      page(
+        'Motion Page',
+        '<h1>motion</h1><script>let n=0;setInterval(()=>{document.body.style.background=n++%2?"#12161f":"#1d2430"},120)</script>',
+      ),
+    );
+    return;
+  }
   if (pathname === '/redirect') {
     res.writeHead(302, { location: '/second' });
     res.end();
@@ -319,12 +329,15 @@ try {
 
     const frame = await framePromise;
     assert.equal(frame.readUInt32BE(0), 0x56584650, 'frame magic');
-    assert.equal(frame.readUInt8(4), 1, 'frame version');
+    assert.equal(frame.readUInt8(4), 2, 'frame version');
     const idLength = frame.readUInt8(5);
-    assert.equal(frame.toString('utf8', 6, 6 + idLength), tabId);
-    assert.ok(frame.length > 6 + idLength + 500, 'frame contains JPEG data');
-    assert.equal(frame[6 + idLength], 0xff, 'JPEG SOI marker');
-    assert.equal(frame[7 + idLength], 0xd8, 'JPEG SOI marker');
+    const frameWidth = frame.readUInt16BE(6);
+    const frameHeight = frame.readUInt16BE(8);
+    assert.equal(frame.toString('utf8', 10, 10 + idLength), tabId);
+    assert.ok(frameWidth >= 320 && frameHeight >= 240, 'frame carries its pixel size');
+    assert.ok(frame.length > 10 + idLength + 500, 'frame contains JPEG data');
+    assert.equal(frame[10 + idLength], 0xff, 'JPEG SOI marker');
+    assert.equal(frame[11 + idLength], 0xd8, 'JPEG SOI marker');
   });
 
   await check('page title is tracked from the live DOM', async () => {
@@ -491,6 +504,44 @@ try {
     }
   });
 
+  await check('each session gets its own audio capture', async () => {
+    const info = await (await fetch(`${origin}/api/audio`, { headers: { cookie } })).json();
+    if (info.status === 'unavailable') return;
+
+    const login = await fetch(`${origin}/api/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin },
+      body: JSON.stringify({ password: 'smoke-password' }),
+    });
+    assert.equal(login.status, 200);
+    const secondCookie = (login.headers.getSetCookie?.()[0] || login.headers.get('set-cookie')).split(';')[0];
+    assert.notEqual(secondCookie, cookie, 'a second login is a second session');
+
+    const listen = (session) =>
+      new Promise((resolve, reject) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${PROXY_PORT}/ws/audio`, {
+          headers: { cookie: session, origin },
+        });
+        const timer = setTimeout(() => reject(new Error('no audio for this session')), 25_000);
+        let total = 0;
+        socket.on('message', (data, isBinary) => {
+          if (!isBinary) return;
+          total += data.length;
+          if (total < 2048) return;
+          clearTimeout(timer);
+          socket.close();
+          resolve();
+        });
+        socket.once('error', reject);
+      });
+
+    await listen(cookie);
+    await listen(secondCookie);
+
+    const health = await (await fetch(`${origin}/api/health`, { headers: { cookie } })).json();
+    assert.ok(health.audioStreams >= 2, `expected one capture per session, saw ${health.audioStreams}`);
+  });
+
   await check('audio socket refuses unauthenticated clients', async () => {
     const denied = new WebSocket(`ws://127.0.0.1:${PROXY_PORT}/ws/audio`, { headers: { origin } });
     const outcome = await new Promise((resolve) => {
@@ -500,6 +551,63 @@ try {
     });
     assert.notEqual(outcome, 'open');
     denied.terminate();
+  });
+
+  await check('streaming pauses while the viewer is hidden', async () => {
+    const countFrames = (ms) =>
+      new Promise((resolve) => {
+        let count = 0;
+        const onMessage = (data, isBinary) => {
+          if (isBinary) count += 1;
+        };
+        ws.on('message', onMessage);
+        setTimeout(() => {
+          ws.off('message', onMessage);
+          resolve(count);
+        }, ms);
+      });
+
+    ws.send(JSON.stringify({ t: 'tab:activate', id: tabId }));
+    ws.send(JSON.stringify({ t: 'nav', tabId, input: `${siteUrl}motion` }));
+    const visible = await countFrames(2200);
+    assert.ok(visible > 0, `expected frames while visible, saw ${visible}`);
+
+    ws.send(JSON.stringify({ t: 'stream', tabId, active: false }));
+    await sleep(700);
+    const hidden = await countFrames(1500);
+    assert.equal(hidden, 0, `a hidden viewer still received ${hidden} frames`);
+
+    ws.send(JSON.stringify({ t: 'stream', tabId, active: true }));
+    await sleep(500);
+    const resumed = await countFrames(2200);
+    assert.ok(resumed > 0, 'frames should resume when the viewer returns');
+  });
+
+  await check('activity stats are auth-guarded and report bounded resources', async () => {
+    const denied = await fetch(`${origin}/api/stats`);
+    assert.equal(denied.status, 401);
+    const response = await fetch(`${origin}/api/stats`, { headers: { cookie } });
+    assert.equal(response.status, 200);
+    const stats = await response.json();
+    assert.equal(stats.ok, true);
+    assert.ok(stats.process.rssMb > 0, 'resident memory should be reported');
+    assert.ok(stats.resources.liveBrowsers <= stats.resources.maxLiveBrowsers, 'browsers stay within the cap');
+    assert.ok(stats.resources.liveTabs <= stats.resources.maxLiveTabs, 'pages stay within the cap');
+    assert.ok(stats.resources.maxLiveTabs >= 1);
+    assert.ok(stats.limits.browserIdleSeconds >= 15);
+  });
+
+  await check('reclaim refuses cross-origin calls and reports releases', async () => {
+    const cross = await fetch(`${origin}/api/reclaim`, {
+      method: 'POST',
+      headers: { origin: 'https://evil.example', cookie },
+    });
+    assert.equal(cross.status, 403);
+    const response = await fetch(`${origin}/api/reclaim`, { method: 'POST', headers: { origin, cookie } });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.ok(body.released >= 0);
   });
 
   await check('closing a tab removes it from the persisted workspace', async () => {
