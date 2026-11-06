@@ -21,6 +21,9 @@ let pendingMove = null;
 let zoom = 1;
 let frameSize = null;
 let contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
+let pendingBitmap = null;
+let paintScheduled = false;
+let paintedRect = null;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -64,6 +67,9 @@ export const initViewport = ({ send }) => {
   });
 
   connection.addEventListener('frame', (event) => {
+    // A hidden embedding page has nowhere to paint: skipping the decode costs
+    // nothing and saves the whole viewing cost while the tab is backgrounded.
+    if (document.hidden) return;
     pendingFrame = event.detail;
     if (!decoding) pump();
   });
@@ -114,6 +120,10 @@ export const setActiveTab = (tab) => {
     currentTabId = id;
     hasFrame = false;
     frameSize = null;
+    if (pendingBitmap) {
+      pendingBitmap.close();
+      pendingBitmap = null;
+    }
     contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
     clearCanvas();
     hideOverlay();
@@ -208,6 +218,7 @@ const renderOverlay = (mode, { title = '', text = '', actionLabel = '', action =
 
 const clearCanvas = () => {
   if (!dom.ctx) return;
+  paintedRect = null;
   dom.ctx.fillStyle = '#07080c';
   dom.ctx.fillRect(0, 0, dom.canvas.width || 1, dom.canvas.height || 1);
 };
@@ -375,12 +386,47 @@ const drawFrame = async (buffer) => {
     bitmap.close();
     return;
   }
-  if (dom.ctx) {
+  schedulePaint(bitmap);
+};
+
+/**
+ * One paint per animation frame: several frames can decode between paints, and
+ * only the newest one is worth showing. The previous bitmap is released here so
+ * a burst does not pile up GPU memory.
+ */
+const schedulePaint = (bitmap) => {
+  if (pendingBitmap) pendingBitmap.close();
+  pendingBitmap = bitmap;
+  if (paintScheduled) return;
+  paintScheduled = true;
+  requestAnimationFrame(paintPending);
+};
+
+const paintPending = () => {
+  paintScheduled = false;
+  const bitmap = pendingBitmap;
+  pendingBitmap = null;
+  if (!bitmap) return;
+  if (!dom.ctx || !currentTabId) {
+    bitmap.close();
+    return;
+  }
+  fitContent();
+  const { x, y, width, height } = contentRect;
+  // The letterbox only moves when the frame or canvas changes; repainting the
+  // whole canvas on every frame was a full-surface fill at the stream rate.
+  if (
+    !paintedRect ||
+    paintedRect.x !== x ||
+    paintedRect.y !== y ||
+    paintedRect.width !== width ||
+    paintedRect.height !== height
+  ) {
     dom.ctx.fillStyle = '#07070a';
     dom.ctx.fillRect(0, 0, dom.canvas.width, dom.canvas.height);
-    fitContent();
-    dom.ctx.drawImage(bitmap, contentRect.x, contentRect.y, contentRect.width, contentRect.height);
+    paintedRect = { x, y, width, height };
   }
+  dom.ctx.drawImage(bitmap, x, y, width, height);
   bitmap.close();
   hasFrame = true;
   if (overlayMode === 'loading') hideOverlay();

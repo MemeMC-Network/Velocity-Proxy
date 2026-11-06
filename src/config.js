@@ -114,6 +114,15 @@ export const config = Object.freeze({
   audioPactlPath: text(process.env.AUDIO_PACTL_PATH, 'pactl'),
 
   chromiumPath: text(process.env.CHROMIUM_PATH),
+  // Which binary to launch: `auto` prefers an installed, auto-updating Chrome,
+  // then Edge, and falls back to Playwright's bundled Chromium.
+  chromiumChannel: (() => {
+    const value = text(process.env.CHROMIUM_CHANNEL, 'auto').toLowerCase();
+    return ['auto', 'chrome', 'msedge', 'bundled'].includes(value) ? value : 'auto';
+  })(),
+  // Advertised Chrome version in User-Agent and Client Hints. Empty = the real
+  // build's version; set it when a site gates on a specific version.
+  chromeVersion: text(process.env.CHROME_VERSION),
   browserMode: text(process.env.BROWSER_MODE, 'headless').toLowerCase() === 'headed' ? 'headed' : 'headless',
   chromiumSandbox: text(process.env.CHROMIUM_SANDBOX, 'auto').toLowerCase(),
   chromiumArgs: text(process.env.CHROMIUM_ARGS).split(/\s+/).filter(Boolean),

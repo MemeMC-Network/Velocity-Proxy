@@ -37,6 +37,8 @@ const score = (text, query) => {
 const commands = () => [
   { label: 'New tab', meta: 'Open a fresh tab', icon: 'plus', hint: 'Ctrl T', keywords: 'create open add', run: () => actions.newTab?.() },
   { label: 'Reopen closed tab', meta: 'Restore the last closed page', icon: 'back', hint: 'Ctrl ⇧ T', keywords: 'undo restore', run: () => actions.reopenClosed?.() },
+  { label: 'Find in page', meta: 'Highlight and step through matches', icon: 'search', hint: 'Ctrl F', keywords: 'search text highlight', run: () => actions.findInPage?.() },
+  { label: 'Keyboard shortcuts', meta: 'Every shortcut in one place', icon: 'keyboard', hint: 'Ctrl /', keywords: 'keys help cheatsheet', run: () => actions.shortcuts?.() },
   { label: 'Reload page', icon: 'reload', hint: 'Ctrl R', keywords: 'refresh', run: () => actions.reload?.() },
   { label: 'Back', icon: 'back', hint: 'Alt ←', keywords: 'history previous', run: () => actions.goBack?.() },
   { label: 'Forward', icon: 'forward', hint: 'Alt →', keywords: 'history next', run: () => actions.goForward?.() },

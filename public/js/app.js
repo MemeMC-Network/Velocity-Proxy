@@ -21,6 +21,7 @@ import { createSuggester, faviconNode, menu, prettyHost, toast } from './ui.js';
 import {
   clearViewport,
   ensureSizePublished,
+  focusViewport,
   forwardKey,
   getZoom,
   hideOverlay,
@@ -66,6 +67,8 @@ const cacheElements = () => {
     'login', 'login-form', 'login-password', 'login-error', 'login-submit', 'login-brand',
     'shortcut-modal', 'shortcut-modal-title', 'shortcut-name', 'shortcut-url', 'shortcut-cancel', 'shortcut-save',
     'dialog-modal', 'dialog-title', 'dialog-message', 'dialog-input', 'dialog-cancel', 'dialog-ok',
+    'find-bar', 'find-input', 'find-count', 'find-prev', 'find-next', 'find-close', 'find-btn', 'find-glyph',
+    'shortcuts-modal', 'shortcuts-close',
   ];
   for (const id of ids) {
     els[id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = document.getElementById(id);
@@ -238,6 +241,13 @@ const wireConnection = () => {
   connection.addEventListener('dialog', (event) => showDialog(event.detail.dialog));
   connection.addEventListener('screenshot', (event) => saveScreenshot(event.detail));
 
+  connection.addEventListener('find', (event) => {
+    const detail = event.detail;
+    if (!detail || (detail.tabId && detail.tabId !== state.activeId)) return;
+    if ((els.findInput?.value || '') !== (detail.query || '')) return;
+    renderFindState(Number(detail.matches) || 0, Number(detail.active) || 0);
+  });
+
   connection.addEventListener('pong', (event) => {
     const sent = Number(event.detail.ts);
     if (Number.isFinite(sent)) {
@@ -385,6 +395,7 @@ const updateTabNode = (node, tab) => {
 const activateTab = (id) => {
   const tab = state.tabs.get(id);
   if (!tab) return;
+  closeFind({ restoreFocus: false });
   setActiveId(id);
   renderAll();
   applyActiveView();
@@ -732,6 +743,24 @@ const wireChrome = () => {
   });
   els.activityBtn?.addEventListener('click', () => openSystem());
   els.fullscreenBtn?.addEventListener('click', () => toggleFullscreen());
+  els.findBtn?.addEventListener('click', () => openFind());
+  els.findClose?.addEventListener('click', () => closeFind());
+  els.findPrev?.addEventListener('click', () => stepFind(false));
+  els.findNext?.addEventListener('click', () => stepFind(true));
+  els.findInput?.addEventListener('input', () => scheduleFind());
+  els.findInput?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      stepFind(!event.shiftKey);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      closeFind();
+    }
+  });
+  els.shortcutsClose?.addEventListener('click', () => closeShortcuts());
+  els.shortcutsModal?.addEventListener('pointerdown', (event) => {
+    if (event.target === els.shortcutsModal) closeShortcuts();
+  });
   els.themeToggle.addEventListener('click', () => {
     const current = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
     setTheme(current === 'light' ? 'dark' : 'light');
@@ -749,6 +778,11 @@ const wireChrome = () => {
   els.copyUrl.innerHTML = icon('link', 18);
   if (els.activityBtn) els.activityBtn.innerHTML = icon('activity', 18);
   if (els.fullscreenBtn) els.fullscreenBtn.innerHTML = icon('expand', 18);
+  if (els.findBtn) els.findBtn.innerHTML = icon('search', 18);
+  if (els.findGlyph) els.findGlyph.innerHTML = icon('search', 15);
+  if (els.findPrev) els.findPrev.innerHTML = icon('chevronDown', 15);
+  if (els.findNext) els.findNext.innerHTML = icon('chevronDown', 15);
+  if (els.findClose) els.findClose.innerHTML = icon('close', 15);
 };
 
 const toggleBookmark = () => {
@@ -821,6 +855,68 @@ const applyZoom = (value) => {
   toast(`Zoom ${Math.round(next * 100)}%`, { tone: 'info', timeout: 1500 });
 };
 
+/* -------------------------------------------------------------------- find */
+
+const findState = { open: false, timer: null, query: '' };
+
+const renderFindState = (matches, active) => {
+  const hasQuery = Boolean(els.findInput?.value);
+  els.findBar?.classList.toggle('is-empty', hasQuery && matches === 0);
+  if (!els.findCount) return;
+  els.findCount.textContent = hasQuery ? (matches ? `${active}/${matches}` : '0/0') : '';
+};
+
+const closeFind = ({ restoreFocus = true } = {}) => {
+  if (!findState.open) return;
+  findState.open = false;
+  clearTimeout(findState.timer);
+  if (els.findBar) els.findBar.hidden = true;
+  if (els.findInput) els.findInput.value = '';
+  if (state.activeId) send({ t: 'find:stop', tabId: state.activeId });
+  if (restoreFocus) focusViewport();
+};
+
+const openFind = () => {
+  const tab = activeTab();
+  if (!tab?.url) {
+    toast('Open a page to search inside it', { tone: 'info' });
+    return;
+  }
+  findState.open = true;
+  if (els.findBar) els.findBar.hidden = false;
+  els.findInput?.focus({ preventScroll: true });
+  els.findInput?.select();
+  if (els.findInput?.value && state.activeId) {
+    send({ t: 'find', tabId: state.activeId, text: els.findInput.value });
+  }
+};
+
+const scheduleFind = (delay = 140) => {
+  clearTimeout(findState.timer);
+  findState.timer = setTimeout(() => {
+    if (!state.activeId) return;
+    findState.query = els.findInput?.value || '';
+    send({ t: 'find', tabId: state.activeId, text: findState.query });
+    if (!findState.query) renderFindState(0, 0);
+  }, delay);
+};
+
+const stepFind = (forward) => {
+  const text = els.findInput?.value || '';
+  if (!text || !state.activeId) return;
+  send({ t: 'find', tabId: state.activeId, text, findNext: true, forward });
+};
+
+const openShortcuts = () => {
+  if (!els.shortcutsModal) return;
+  els.shortcutsModal.hidden = false;
+  els.shortcutsClose?.focus();
+};
+
+const closeShortcuts = () => {
+  if (els.shortcutsModal) els.shortcutsModal.hidden = true;
+};
+
 /* ------------------------------------------------------------------- keys */
 
 const wireGlobalKeys = () => {
@@ -857,6 +953,16 @@ const wireGlobalKeys = () => {
       if (mod && key === 'k') {
         event.preventDefault();
         openPalette();
+        return;
+      }
+      if (mod && key === 'f') {
+        event.preventDefault();
+        openFind();
+        return;
+      }
+      if (mod && (event.key === '/' || event.key === '?')) {
+        event.preventDefault();
+        openShortcuts();
         return;
       }
       if (mod && key === 'r') {
@@ -908,6 +1014,14 @@ const wireGlobalKeys = () => {
         return;
       }
       if (event.key === 'Escape') {
+        if (findState.open) {
+          closeFind();
+          return;
+        }
+        if (!els.shortcutsModal?.hidden) {
+          closeShortcuts();
+          return;
+        }
         if (closePalette()) return;
         if (els.settingsPanel.classList.contains('is-open')) {
           closeSettings();
@@ -1176,6 +1290,8 @@ const wireSettingsEvents = () => {
 
 const paletteActions = {
   activateTab,
+  findInPage: openFind,
+  shortcuts: openShortcuts,
   newTab,
   closeTab,
   navigate,

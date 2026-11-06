@@ -420,6 +420,23 @@ async function handle(client, workspace, message) {
       return;
     }
 
+    case 'find': {
+      const { session } = await requireLive();
+      if (!session) return;
+      const result = await session.find(typeof message.text === 'string' ? message.text : '', {
+        forward: message.forward !== false,
+        findNext: Boolean(message.findNext),
+      });
+      if (result) client.send({ t: 'find', tabId: activeId, ...result });
+      return;
+    }
+
+    case 'find:stop': {
+      const { session } = await requireLive();
+      await session?.stopFind();
+      return;
+    }
+
     case 'copy': {
       const { session } = await requireLive();
       if (!session) return;

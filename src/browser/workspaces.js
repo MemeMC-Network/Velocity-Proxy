@@ -7,6 +7,7 @@ import { HttpError } from '../errors.js';
 import { log } from '../logger.js';
 import { assertPublicHttpUrl, isBlockedUrl } from '../security/ip-guard.js';
 import { blockedUrlReason } from '../security/content-filter.js';
+import { rewriteDocumentTarget } from './site-fixes.js';
 import { hostOf, randomId, shortHash } from '../util.js';
 
 const PLATFORM =
@@ -238,9 +239,15 @@ export class WorkspaceManager {
       '--disable-default-apps',
       '--disable-sync',
       '--disable-breakpad',
+      '--disable-domain-reliability',
+      '--disable-client-side-phishing-detection',
+      '--disable-component-extensions-with-background-pages',
+      '--no-service-autorun',
+      '--disable-prompt-on-repost',
       '--no-pings',
       '--metrics-recording-only',
-      '--disable-features=Translate,MediaRouter,OptimizationHints',
+      '--disable-features=Translate,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,' +
+        'AutofillServerCommunication,CalculateNativeWinOcclusion,NotificationTriggers',
       ...(this.config.chromiumJsHeapMb > 0
         ? [`--js-flags=--max-old-space-size=${this.config.chromiumJsHeapMb}`]
         : []),
@@ -266,31 +273,136 @@ export class WorkspaceManager {
     const sandboxPreference = this.config.chromiumSandbox;
     const wantSandbox = sandboxPreference === 'on' || (sandboxPreference === 'auto' && !this.config.isRoot);
 
-    const attempt = async (sandbox) => {
-      const browser = await chromium.launch({ ...base, chromiumSandbox: sandbox });
+    const attempt = async (sandbox, candidate) => {
+      const browser = await chromium.launch({
+        ...base,
+        chromiumSandbox: sandbox,
+        ...(candidate.channel ? { channel: candidate.channel } : {}),
+      });
       this.browserVersion = browser.version();
-      log.info(`Chromium launched (${headless ? 'headless' : 'headed'}, sandbox ${sandbox ? 'on' : 'off'}, version ${browser.version()})`);
+      this.browserChannel = candidate.label;
+      log.info(
+        `Chromium launched (${candidate.label}, ${headless ? 'headless' : 'headed'}, ` +
+          `sandbox ${sandbox ? 'on' : 'off'}, version ${browser.version()})`,
+      );
       if (!sandbox) this.sandboxDisabled = true;
       return browser;
     };
 
-    try {
-      return await attempt(wantSandbox);
-    } catch (error) {
-      if (!wantSandbox) throw error;
-      log.warn('Chromium sandbox unavailable, retrying without it:', String(error.message).split('\n')[0]);
-      return attempt(false);
+    let lastError = null;
+    for (const candidate of this.browserCandidates()) {
+      try {
+        return await attempt(wantSandbox, candidate);
+      } catch (error) {
+        lastError = error;
+        if (wantSandbox) {
+          log.warn('Chromium sandbox unavailable, retrying without it:', String(error.message).split('\n')[0]);
+          try {
+            return await attempt(false, candidate);
+          } catch (retryError) {
+            lastError = retryError;
+          }
+        }
+        if (candidate.channel) {
+          log.debug(`${candidate.label} unavailable:`, String(lastError.message).split('\n')[0]);
+        }
+      }
     }
+    throw lastError || new Error('No Chromium binary could be launched');
+  }
+
+  /**
+   * Browser binaries to try, best first. An installed Chrome updates itself and
+   * carries the real Chrome brand plus proprietary codecs; Playwright's bundled
+   * build is pinned to the installed playwright version, so it is the fallback.
+   */
+  browserCandidates() {
+    if (this.config.chromiumPath) return [{ channel: null, label: 'CHROMIUM_PATH binary' }];
+    const bundled = { channel: null, label: 'bundled Chromium' };
+    switch (this.config.chromiumChannel) {
+      case 'chrome':
+        return [{ channel: 'chrome', label: 'Chrome channel' }, bundled];
+      case 'msedge':
+        return [{ channel: 'msedge', label: 'Edge channel' }, bundled];
+      case 'bundled':
+        return [bundled];
+      default:
+        return [
+          { channel: 'chrome', label: 'Chrome channel' },
+          { channel: 'msedge', label: 'Edge channel' },
+          bundled,
+        ];
+    }
+  }
+
+  /** Pads `156`, `156.0.8078` or `156.0.8078.81` into a four-part version. */
+  normalizeVersion(value, fallback) {
+    const parts = String(value || '')
+      .trim()
+      .split('.')
+      .filter((part) => /^\d+$/.test(part));
+    if (!parts.length) return fallback;
+    const filled = parts.slice(0, 4);
+    while (filled.length < 4) filled.push('0');
+    return filled.join('.');
   }
 
   /** A normal desktop Chrome identity for a launched browser (USER_AGENT wins). */
   fingerprintFor(browser) {
-    const version = browser?.version() || '120.0.0.0';
+    const actual = browser?.version() || '120.0.0.0';
+    const version = this.config.chromeVersion
+      ? this.normalizeVersion(this.config.chromeVersion, actual)
+      : actual;
     const major = version.split('.')[0] || '120';
     const userAgent =
       this.config.userAgent ||
       `Mozilla/5.0 (${PLATFORM.uaToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
-    return { userAgent, version, major };
+    return { userAgent, version, major, platformName: PLATFORM.name, platformVersion: PLATFORM.version };
+  }
+
+  /**
+   * Client Hints are sent as HTTP headers, so rewriting the JS-visible UA string
+   * is not enough: Chromium still advertises "HeadlessChrome" in `sec-ch-ua`
+   * and X answers the document with 403. Set the full metadata over CDP on the
+   * page before it navigates.
+   */
+  async applyFingerprint(page) {
+    if (!page || page.isClosed()) return;
+    const fingerprint = this.fingerprintFor(page.context().browser?.());
+    const brands = [
+      { brand: 'Google Chrome', version: fingerprint.major },
+      { brand: 'Chromium', version: fingerprint.major },
+      { brand: 'Not A(Brand', version: '24' },
+    ];
+    let cdp;
+    try {
+      cdp = await page.context().newCDPSession(page);
+      await cdp.send('Network.setUserAgentOverride', {
+        userAgent: fingerprint.userAgent,
+        acceptLanguage: 'en-US,en',
+        platform: 'Win32',
+        userAgentMetadata: {
+          brands,
+          fullVersionList: [
+            { brand: 'Google Chrome', version: fingerprint.version },
+            { brand: 'Chromium', version: fingerprint.version },
+            { brand: 'Not A(Brand', version: '24.0.0.0' },
+          ],
+          fullVersion: fingerprint.version,
+          platform: fingerprint.platformName,
+          platformVersion: fingerprint.platformVersion,
+          architecture: 'x86',
+          model: '',
+          mobile: false,
+          bitness: '64',
+          wow64: false,
+        },
+      });
+    } catch (error) {
+      log.debug('user agent override failed', String(error.message).split('\n')[0]);
+    }
+    // The session must stay attached: detaching it reverts the override and
+    // Chromium starts advertising HeadlessChrome again.
   }
 
   async createContext(workspace, { storageState } = {}) {
@@ -348,6 +460,14 @@ export class WorkspaceManager {
         } catch {
           /* validation failure: fall through to continue */
         }
+        if (route.request().isNavigationRequest()) {
+          const fixed = rewriteDocumentTarget(requestUrl);
+          if (fixed) {
+            log.debug('site compatibility rewrite', requestUrl.slice(0, 90), '->', fixed);
+            await route.continue({ url: fixed }).catch(() => {});
+            return;
+          }
+        }
         await route.continue().catch(() => {});
       });
     }
@@ -369,6 +489,8 @@ export class WorkspaceManager {
     }
 
     context.on('page', (page) => {
+      // Popups navigate immediately, so the header identity has to be set now.
+      this.applyFingerprint(page).catch(() => {});
       setTimeout(() => {
         this.adoptPage(workspace, page).catch((error) => log.debug('popup adopt failed', error.message));
       }, 350).unref?.();
@@ -746,6 +868,7 @@ class Workspace {
     const context = await this.manager.createContext(this, { storageState });
     const page = await context.newPage();
     this.manager.pageOwners.set(page, record.id);
+    await this.manager.applyFingerprint(page);
     const session = new TabSession({
       id: record.id,
       workspace: this,

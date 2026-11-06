@@ -771,6 +771,20 @@ try {
     assert.ok(filter.blockedDomains().length > 50);
   });
 
+  await check('site compatibility rewrites a broken TikTok search to discover', async () => {
+    const fixes = await import('../src/browser/site-fixes.js');
+    assert.equal(
+      fixes.rewriteDocumentTarget('https://www.tiktok.com/search?q=funny%20cats'),
+      'https://www.tiktok.com/discover/funny-cats',
+    );
+    assert.equal(
+      fixes.rewriteDocumentTarget('https://www.tiktok.com/search/video?q=dogs'),
+      'https://www.tiktok.com/discover/dogs',
+    );
+    assert.equal(fixes.rewriteDocumentTarget('https://www.tiktok.com/@someone/video/1'), null);
+    assert.equal(fixes.rewriteDocumentTarget('https://example.com/search?q=cats'), null);
+  });
+
   console.log(`\n${results.filter((entry) => entry.ok).length}/${results.length} checks passed\n`);
   await stopChild();
   process.exit(0);

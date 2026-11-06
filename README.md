@@ -72,7 +72,10 @@ a toolbar activity panel (`/api/stats`) shows server memory, live browsers and p
 caps, sessions, audio streams and uptime, and releases idle Chromium processes on demand
 (`/api/reclaim`). Browsing adds page zoom (`Ctrl` +/-/`0`, a real reflow of the remote page),
 fullscreen (`F11`, or a button), a screenshot capture that saves the remote page as JPEG, and
-automatic edge-to-edge layout when a page enters HTML fullscreen.
+automatic edge-to-edge layout when a page enters HTML fullscreen. **Find in page** (`Ctrl+F` or the
+toolbar magnifier) paints matches with the CSS Custom Highlight API — no DOM mutation, so SPAs keep
+working — and reports `3/17` with next/previous and a red `0/0` when nothing matches. `Ctrl+/`
+opens a keyboard shortcut sheet, and both are also commands in the palette.
 
 **Rendering**
 Per-tab `BrowserContext` (isolated cookies, localStorage, cache, permissions), CDP
@@ -314,6 +317,57 @@ journalctl -u velocity-proxy -f
   safe-search flags (`safe=active`, `adlt=strict`, `kp=1`, `safesearch=strict`) and YouTube gets its
   restricted-mode cookie.
 
+## Browser build
+
+`CHROMIUM_CHANNEL` chooses the binary that gets launched:
+
+| Value | Behaviour |
+| --- | --- |
+| `auto` (default) | Installed Google Chrome, then Microsoft Edge, then Playwright's bundled Chromium |
+| `chrome` / `msedge` | That channel, falling back to bundled Chromium |
+| `bundled` | Playwright's bundled Chromium only |
+
+`CHROMIUM_PATH` still wins over all of them. `auto` is the useful default on a desktop or a
+server that installs Chrome: an installed Chrome updates itself and ships the real Chrome brand
+plus proprietary codecs, while Playwright's bundled build is frozen at whatever shipped with the
+installed `playwright` version. Every launch logs the binary it settled on, for example
+`Chromium launched (Chrome channel, headless, sandbox on, version 156.0.8078.81)`.
+
+`CHROME_VERSION` overrides the version advertised in `User-Agent` and in Client Hints
+(`sec-ch-ua`, `navigator.userAgentData`) without touching the binary — useful when a site refuses
+anything below a particular build. It defaults to the real version, and the header, the JS brands
+and the UA string are generated from that one value so they never disagree.
+
+Snapchat was the reason this exists, and here is what testing actually showed: with bundled
+Chromium 156.0.8078.4 and with installed Chrome 156.0.8078.81, `www.snapchat.com` returns 200 and
+renders its sign-in page, and its auth endpoint answers a bad username with “We couldn't find an
+account for that username, email, or phone number”. Their version gate was not rejecting the
+document. Real Chrome's brand and codecs are still the better identity for strict sites, and
+`CHROME_VERSION` covers a site that does gate on a version, but anything past Snapchat's login
+step still needs a real Snapchat account to verify.
+
+## Site compatibility
+
+Two sites need help a plain Chromium launch cannot give them, and both fixes are small and
+explicit rather than a broad stealth mode:
+
+- **X (x.com) answered the document itself with `403`.** Its check reads the `sec-ch-ua` HTTP
+  header, which a headless launch advertises as `HeadlessChrome` even after the JavaScript-visible
+  user agent is rewritten. Every page now receives `Network.setUserAgentOverride` with full
+  `userAgentMetadata` (Google Chrome / Chromium / Not A(Brand, Windows, x86-64) before it
+  navigates, so the header, `navigator.userAgentData` and `navigator.platform` agree. x.com then
+  serves its normal sign-in page; the same override is what makes other strict sites stop
+  treating the browser as automation.
+- **TikTok's `/search?q=` page never leaves its skeleton grid.** Its bundle requests
+  `webapp-desktop/static/worker/multiple.worker-0.5.1.js`, which answers `404` for every client we
+  tested — including a plain `fetch` outside the browser — so the result feed is never requested.
+  `/discover/<term>` renders the same kind of grid server-side, so document requests to `/search`
+  and `/search/video` are rewritten to `/discover/<slug>` by `src/browser/site-fixes.js`. The query
+  term is preserved, host and scheme are unchanged, and every other request is untouched.
+
+That TikTok rewrite is a workaround for a site bug, not a general search engine: the discover page
+shows tag-style results and related tags instead of TikTok's own ranked feed.
+
 ## Cloud gaming (GeForce NOW and similar WebRTC apps)
 
 `play.geforcenow.com` now renders through the proxy and reaches its sign-in screen. Two things were
@@ -356,7 +410,7 @@ were.
 ## Verification
 
 `npm run smoke` boots the real server with a throwaway data dir, a local target site and
-`AUDIO_SOURCE=tone`, then drives the HTTP + WebSocket protocol end to end. It covers 37 assertions:
+`AUDIO_SOURCE=tone`, then drives the HTTP + WebSocket protocol end to end. It covers 38 assertions:
 unauthenticated API/WS refusal, the `SameSite=None; Secure` login cookie, root SPA route,
 `frame-ancestors *` / no `X-Frame-Options` / `autoplay=*` (iframe embedding), legacy tab-path
 redirects, favicon
@@ -368,9 +422,10 @@ unauthenticated audio sockets, a screencast that stops receiving frames while th
 is hidden and resumes on return, the auth-guarded `/api/stats` snapshot, cross-origin refusal on
 `/api/reclaim`, the absence of
 iframes/`window.open`/`history.pushState` in the client sources, SSRF unit checks, URL detection,
-the content filter (blocked domain, explicit query, blocked in-page link), and a fingerprint check
-that the remote browser does not present itself as headless.
-The suite passed 37/37 on this machine (Chromium 156 headless, Node 22, ffmpeg 8.0.1).
+the content filter (blocked domain, explicit query, blocked in-page link), the TikTok search
+compatibility rewrite, and a fingerprint check that the remote browser does not present itself as
+headless.
+The suite passed 38/38 on this machine (Chromium 156 headless, Node 22, ffmpeg 8.0.1).
 
 Manual checks against the live UI (same build):
 
@@ -387,6 +442,10 @@ Manual checks against the live UI (same build):
 | Embedded in a cross-origin iframe | Framed shell rendered; every asset and `/api/session` returned 200 inside the frame |
 | Back / forward / reload / stop, history per tab | Work (Wikipedia → example.com → Wikipedia) |
 | Google search + suggestions | Query reached Google; the datacenter IP got a reCAPTCHA instead of results |
+| `x.com` | Sign-in page renders (HTTP 200) with the Client Hints override; tabs read `X. It’s what’s happening` |
+| `tiktok.com/search?q=cats` | Renders the discover grid for “cats” with video cards and related tags |
+| Find in page | `Ctrl+F` reports `1/1` on example.com, steps with Enter, clears its highlight on Esc |
+| Browser build | `auto` launched installed Chrome 156.0.8078.81; X still 200, Snapchat sign-in page renders |
 | Responsive layout | Desktop and 430 px layouts both behave (toolbar items collapse on narrow screens) |
 
 Not verifiable on the Windows development machine: the systemd unit, Nginx/TLS and Certbot
@@ -423,6 +482,19 @@ should be exercised on a throwaway VPS before production.
   `SCREENCAST_FPS` limits frame encoding — frames above the cap are skipped in the compositor, so
   they are never encoded at all — and unwatched tabs are polled every `IDLE_POLL_MS` instead of
   every 1.1 s. Favicon refreshes are throttled to once per host per minute.
+- Frames are packed into one preallocated buffer with a reusable header: 18.6 µs per 60 KB frame
+  against 24.0 µs for the old `Buffer.concat` path, and one allocation instead of two
+  (measured locally with the same frame payload).
+- The viewer paints at most once per animation frame and releases superseded bitmaps, so a burst
+  of frames decodes without painting intermediate states. The letterbox fill is skipped while the
+  frame rectangle is unchanged, and frames that arrive while the embedding page is hidden are
+  dropped before decoding — a 1280×800 q62 frame costs 2.64 ms to decode on this machine
+  (measured over 120 `createImageBitmap` calls).
+- `Page.getNavigationHistory` runs only when the document URL changes instead of on every poll
+  tick, which removes one CDP round trip per second per watched tab.
+- Chromium launches without services a server browser has no use for: component updates, domain
+  reliability, client-side phishing detection, background extension pages, autofill server
+  traffic, native-window occlusion tracking and repost prompts.
 - The UI redraws only the tab bar and home tiles it must: chrome, tiles and cards are plain CSS
   with no backdrop blur or continuously animating decoration, so sitting on the home page costs
   nothing until you type.
@@ -453,7 +525,7 @@ deploy/
   nginx-velocity.conf, velocity-proxy.service
 scripts/
   start-with-audio.sh    PulseAudio null sink + service entrypoint
-  smoke-test.mjs         37-check end-to-end suite
+  smoke-test.mjs         38-check end-to-end suite
 install.sh · uninstall.sh · update.sh · start.sh
 ```
 

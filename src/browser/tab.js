@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { log } from '../logger.js';
 import { assertPublicHttpUrl } from '../security/ip-guard.js';
 import { blockedUrlReason } from '../security/content-filter.js';
+import { rewriteDocumentTarget } from './site-fixes.js';
 import { buildKeyParams } from './keys.js';
 import { clamp, hostOf } from '../util.js';
 
@@ -49,6 +50,15 @@ export class TabSession extends EventEmitter {
     this.context = context;
     this.page = page;
     this.config = config;
+
+    // One reusable frame header: the id never changes, only the pixel size.
+    const idBuffer = Buffer.from(String(id), 'utf8').subarray(0, 32);
+    this.frameHeader = Buffer.alloc(10 + idBuffer.length);
+    this.frameHeader.writeUInt32BE(MAGIC, 0);
+    this.frameHeader.writeUInt8(2, 4);
+    this.frameHeader.writeUInt8(idBuffer.length, 5);
+    idBuffer.copy(this.frameHeader, 10);
+    this.historyUrl = null;
 
     this.clients = new Set();
     this.cdp = null;
@@ -323,9 +333,12 @@ export class TabSession extends EventEmitter {
         changed = true;
       }
 
-      if (this.hasViewers()) {
+      // Back/forward availability only changes with the document, so this CDP
+      // round trip runs per navigation instead of every poll tick.
+      if (this.hasViewers() && this.state.url && this.state.url !== this.historyUrl) {
         const history = await this.cdp.send('Page.getNavigationHistory').catch(() => null);
         if (history) {
+          this.historyUrl = this.state.url;
           const back = history.currentIndex > 0;
           const forward = history.currentIndex < history.entries.length - 1;
           if (back !== this.state.canGoBack || forward !== this.state.canGoForward) {
@@ -551,18 +564,18 @@ export class TabSession extends EventEmitter {
     this.lastFrameSentAt = now;
 
     const frame = Buffer.from(event.data, 'base64');
-    const idBuffer = Buffer.from(this.id, 'utf8').subarray(0, 32);
     // Version 2 carries the frame's own pixel size, so the client can letterbox
     // instead of stretching whenever page size and viewport disagree.
     const width = clamp(Math.round(event.metadata?.deviceWidth || this.viewport.width), 1, 65535);
     const height = clamp(Math.round(event.metadata?.deviceHeight || this.viewport.height), 1, 65535);
-    const header = Buffer.alloc(10);
-    header.writeUInt32BE(MAGIC, 0);
-    header.writeUInt8(2, 4);
-    header.writeUInt8(idBuffer.length, 5);
+    const header = this.frameHeader;
     header.writeUInt16BE(width, 6);
     header.writeUInt16BE(height, 8);
-    const packet = Buffer.concat([header, idBuffer, frame]);
+    // One allocation and two copies per frame instead of Buffer.concat, which
+    // allocated twice and copied the JPEG twice at ~30 frames/second/tab.
+    const packet = Buffer.allocUnsafe(header.length + frame.length);
+    header.copy(packet, 0);
+    frame.copy(packet, header.length);
 
     for (const client of viewers) client.sendFrame(packet);
     this.lastActivity = Date.now();
@@ -629,7 +642,9 @@ export class TabSession extends EventEmitter {
   /* ------------------------------------------------------------- navigation */
 
   async navigate(rawUrl) {
-    const target = await assertPublicHttpUrl(rawUrl);
+    // A target a site breaks server-side (TikTok search) is swapped for the
+    // page that renders the same results, before it is ever requested.
+    const target = await assertPublicHttpUrl(rewriteDocumentTarget(rawUrl) || rawUrl);
     if (this.closed) throw new Error('This tab is closed');
     const blockedReason = blockedUrlReason(target.href);
     if (blockedReason) {
@@ -638,6 +653,7 @@ export class TabSession extends EventEmitter {
     }
     this.navSeq += 1;
     const token = this.navSeq;
+    this.historyUrl = null;
     this.state.url = target.href;
     this.state.error = null;
     this.state.status = 'loading';
@@ -674,6 +690,7 @@ export class TabSession extends EventEmitter {
     this.state.loading = true;
     this.armLoadingWatchdog();
     this.emitState();
+    this.historyUrl = null;
     try {
       await this.page.goBack({ waitUntil: 'commit', timeout: 20000 });
     } catch {
@@ -687,6 +704,7 @@ export class TabSession extends EventEmitter {
     this.state.loading = true;
     this.armLoadingWatchdog();
     this.emitState();
+    this.historyUrl = null;
     try {
       await this.page.goForward({ waitUntil: 'commit', timeout: 20000 });
     } catch {
@@ -836,6 +854,106 @@ export class TabSession extends EventEmitter {
     } catch {
       /* ignore */
     }
+  }
+
+  /**
+   * Highlights matches inside the remote page.
+   *
+   * Chromium 156 no longer exposes Page.findInPage over CDP, so this walks the
+   * text nodes and paints ranges with the CSS Custom Highlight API: no DOM
+   * mutation (which would break SPAs) and a real match count to show in the UI.
+   */
+  async find(text, { forward = true, findNext = false } = {}) {
+    if (this.closed || !this.isLive()) return null;
+    const query = typeof text === 'string' ? text.slice(0, 200) : '';
+    if (!query) {
+      await this.stopFind();
+      return { matches: 0, active: 0, query: '' };
+    }
+    try {
+      const result = await this.page.evaluate(
+        ({ needle, forward: dir, findNext: step }) => {
+          if (!window.CSS?.highlights || typeof Highlight !== 'function') {
+            return { unsupported: true, matches: 0, active: 0 };
+          }
+          if (!document.querySelector('style[data-velocity-find]')) {
+            const style = document.createElement('style');
+            style.dataset.velocityFind = '1';
+            style.textContent = '::highlight(velocity-find){background:#ffd76a;color:#151412;}'
+            document.documentElement.appendChild(style);
+          }
+          const root = document.body;
+          if (!root) return { matches: 0, active: 0 };
+          const ranges = [];
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+              const value = node.nodeValue;
+              if (!value || !value.trim()) return NodeFilter.FILTER_REJECT;
+              const parent = node.parentElement;
+              if (!parent) return NodeFilter.FILTER_REJECT;
+              if (/^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA|TITLE)$/.test(parent.tagName)) return NodeFilter.FILTER_REJECT;
+              const view = parent.ownerDocument.defaultView;
+              const style = view.getComputedStyle(parent);
+              if (style.visibility === 'hidden' || style.display === 'none') return NodeFilter.FILTER_REJECT;
+              return NodeFilter.FILTER_ACCEPT;
+            },
+          });
+          let node;
+          let guard = 0;
+          while (ranges.length < 500 && (node = walker.nextNode()) && guard < 20000) {
+            guard += 1;
+            const haystack = node.nodeValue.toLowerCase();
+            let from = 0;
+            while (ranges.length < 500) {
+              const at = haystack.indexOf(needle, from);
+              if (at < 0) break;
+              const range = document.createRange();
+              range.setStart(node, at);
+              range.setEnd(node, at + needle.length);
+              ranges.push(range);
+              from = at + needle.length;
+            }
+          }
+          if (!ranges.length) {
+            window.CSS.highlights.delete('velocity-find');
+            return { matches: 0, active: 0 };
+          }
+          const store = window.__velocityFind || { needle: '', index: -1 };
+          if (store.needle !== needle) {
+            store.needle = needle;
+            store.index = -1;
+          }
+          store.index = step
+            ? (store.index + (dir ? 1 : -1) + ranges.length) % ranges.length
+            : 0;
+          window.__velocityFind = store;
+          window.CSS.highlights.set('velocity-find', new Highlight(...ranges));
+          const active = ranges[store.index];
+          if (active) {
+            const rect = active.getBoundingClientRect();
+            if (rect.top < 0 || rect.bottom > window.innerHeight) {
+              active.startContainer.parentElement?.scrollIntoView({ block: 'center' });
+            }
+          }
+          return { matches: ranges.length, active: store.index + 1 };
+        },
+        { needle: query.toLowerCase(), forward, findNext },
+      );
+      return { matches: Number(result?.matches) || 0, active: Number(result?.active) || 0, query };
+    } catch (error) {
+      log.debug('find failed', this.id, String(error.message).split('\n')[0]);
+      return null;
+    }
+  }
+
+  async stopFind() {
+    if (this.closed || !this.isLive()) return;
+    await this.page
+      .evaluate(() => {
+        window.CSS?.highlights?.delete('velocity-find');
+        window.__velocityFind = null;
+      })
+      .catch(() => {});
   }
 
   async readSelection() {

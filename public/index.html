@@ -62,6 +62,7 @@
           </form>
 
           <div class="toolbar-actions">
+            <button class="icon-btn" id="find-btn" type="button" aria-label="Find in page" title="Find in page (Ctrl+F)"></button>
             <button class="icon-btn" id="activity-btn" type="button" aria-label="Activity" title="Activity"></button>
             <button class="icon-btn" id="fullscreen-btn" type="button" aria-label="Fullscreen" title="Fullscreen (F11)"></button>
             <button class="icon-btn" id="audio-btn" type="button" aria-label="Audio" title="Audio"></button>
@@ -73,6 +74,23 @@
       </header>
 
       <main class="viewport" id="viewport">
+        <div class="findbar" id="find-bar" role="search" aria-label="Find in page" hidden>
+          <span class="findbar-glyph" id="find-glyph"></span>
+          <input
+            class="findbar-input"
+            id="find-input"
+            type="text"
+            placeholder="Find in page"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Find in page"
+          />
+          <span class="findbar-count" id="find-count" aria-live="polite"></span>
+          <button class="findbar-btn" id="find-prev" type="button" aria-label="Previous match" title="Previous match (Shift+Enter)"></button>
+          <button class="findbar-btn" id="find-next" type="button" aria-label="Next match" title="Next match (Enter)"></button>
+          <button class="findbar-btn is-close" id="find-close" type="button" aria-label="Close find" title="Close (Esc)"></button>
+        </div>
+
         <section class="newtab" id="newtab" aria-label="New tab page">
           <div class="nt-inner">
             <header class="nt-top">
@@ -327,6 +345,38 @@
             <span><kbd>↵</kbd> run</span>
             <span id="palette-foot-hint"></span>
           </footer>
+        </div>
+      </div>
+
+      <div class="modal-layer" id="shortcuts-modal" hidden>
+        <div class="modal-card shortcuts-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+          <div class="system-head">
+            <div>
+              <h2>Keyboard shortcuts</h2>
+              <p class="modal-sub">Everything the proxy answers without a mouse.</p>
+            </div>
+            <button class="icon-btn" id="shortcuts-close" type="button" aria-label="Close shortcuts">&times;</button>
+          </div>
+          <div class="keygrid" id="shortcuts-grid">
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>K</kbd></span><em>Command palette</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>F</kbd></span><em>Find in page</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>T</kbd></span><em>New tab</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>W</kbd></span><em>Close tab</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>&#8679;</kbd><kbd>T</kbd></span><em>Reopen closed tab</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>L</kbd></span><em>Address bar</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>Tab</kbd></span><em>Next tab</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>1</kbd>&hellip;<kbd>8</kbd></span><em>Jump to tab</em></div>
+            <div class="keyrow"><span><kbd>Alt</kbd><kbd>&larr;</kbd></span><em>Back</em></div>
+            <div class="keyrow"><span><kbd>Alt</kbd><kbd>&rarr;</kbd></span><em>Forward</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>R</kbd></span><em>Reload</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>D</kbd></span><em>Bookmark</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>+</kbd></span><em>Zoom in</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>&minus;</kbd></span><em>Zoom out</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>0</kbd></span><em>Reset zoom</em></div>
+            <div class="keyrow"><span><kbd>F11</kbd></span><em>Fullscreen</em></div>
+            <div class="keyrow"><span><kbd>Esc</kbd></span><em>Stop loading / close</em></div>
+            <div class="keyrow"><span><kbd>Ctrl</kbd><kbd>/</kbd></span><em>This list</em></div>
+          </div>
         </div>
       </div>
 
