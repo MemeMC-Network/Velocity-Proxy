@@ -73,12 +73,20 @@ export class TabSession extends EventEmitter {
     // Starts at 1 so the very first frame is never skipped; a static page would
     // otherwise wait for damage that may never come.
     this.frameSkip = 1;
+    // Frames per second to capture. Lowered for pages that cannot fit their
+    // byte budget even at the quality floor: losing frames costs nothing in
+    // sharpness, while lowering quality blurs every line of text.
+    this.frameRate = config.screencastFps || 30;
     this.deliveredFrames = 0;
     this.fullscreen = false;
     this.quality = config.frameQuality;
     // A quality the viewer picked by hand is not second-guessed by adaptation.
     this.qualityLocked = false;
     this.viewport = { width: 1280, height: 800 };
+    // Captured frame size as a fraction of the page viewport. Once JPEG quality
+    // reaches its floor this is the only lever that still cuts bytes and encode
+    // cost, so a video-heavy page can drop to 70% instead of saturating the link.
+    this.scale = 1;
     this.pinned = Boolean(meta.pinned);
 
     this.inflight = 0;
@@ -114,7 +122,12 @@ export class TabSession extends EventEmitter {
     // frames, which is exactly what reads as lag.
     this.fpsWindowStart = 0;
     this.fpsWindowFrames = 0;
+    this.fpsWindowBytes = 0;
     this.deliveredFps = 0;
+    // Bytes per second actually put on the wire, which is what a remote viewer
+    // feels. A static page sends two big frames and then nothing, so per-frame
+    // size would misjudge every article on the web.
+    this.deliveredBps = 0;
 
     this.muted = Boolean(meta.muted);
     this.audible = false;
@@ -504,6 +517,7 @@ export class TabSession extends EventEmitter {
     this.clients.add(client);
     this.lastActivity = Date.now();
     this.emitState();
+    this.resumeMedia().catch(() => {});
     this.startStreaming().catch(() => {});
     this.scheduleFaviconRefresh();
     this.poll().catch(() => {});
@@ -513,6 +527,9 @@ export class TabSession extends EventEmitter {
     this.clients.delete(client);
     if (!this.hasViewers()) {
       this.stopStreaming().catch(() => {});
+      // Nobody is listening to this tab's audio (background tabs are muted), so
+      // keep it from decoding video for an empty room.
+      this.pauseMedia().catch(() => {});
     }
   }
 
@@ -523,8 +540,8 @@ export class TabSession extends EventEmitter {
       await this.cdp.send('Page.startScreencast', {
         format: 'jpeg',
         quality: this.quality,
-        maxWidth: Math.round(this.viewport.width),
-        maxHeight: Math.round(this.viewport.height),
+        maxWidth: Math.max(320, Math.round(this.viewport.width * this.scale)),
+        maxHeight: Math.max(240, Math.round(this.viewport.height * this.scale)),
         everyNthFrame: this.frameSkip,
       });
       this.lastFrameAt = Date.now();
@@ -591,8 +608,49 @@ export class TabSession extends EventEmitter {
       return;
     }
     this.streamingActive = next;
-    if (next) await this.startStreaming();
-    else await this.stopStreaming();
+    if (next) {
+      this.resumeMedia().catch(() => {});
+      await this.startStreaming();
+    } else {
+      await this.stopStreaming();
+      // A hidden viewer gets no frames, so there is no reason for the page to
+      // keep playing video behind it.
+      this.pauseMedia().catch(() => {});
+    }
+  }
+
+  async pauseMedia() {
+    if (!this.isLive() || this.closed) return;
+    await this.page
+      .evaluate(() => {
+        for (const el of document.querySelectorAll('video,audio')) {
+          if (el.paused) continue;
+          try {
+            el.pause();
+            el.dataset.velocityPaused = '1';
+          } catch {
+            /* detached element */
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
+  async resumeMedia() {
+    if (!this.isLive() || this.closed) return;
+    await this.page
+      .evaluate(() => {
+        for (const el of document.querySelectorAll('[data-velocity-paused]')) {
+          delete el.dataset.velocityPaused;
+          try {
+            const playing = el.play();
+            playing?.catch?.(() => {});
+          } catch {
+            /* autoplay refused */
+          }
+        }
+      })
+      .catch(() => {});
   }
 
   handleScreencastFrame(event) {
@@ -638,7 +696,7 @@ export class TabSession extends EventEmitter {
     // frame, which guarantees a static page still paints something.
     this.deliveredFrames += 1;
     if (this.deliveredFrames === 1) {
-      const target = Math.max(1, Math.round(60 / (this.config.screencastFps || 30)));
+      const target = Math.max(1, Math.round(60 / this.frameRate));
       if (target !== this.frameSkip) {
         this.frameSkip = target;
         this.restartStreaming().catch(() => {});
@@ -646,34 +704,59 @@ export class TabSession extends EventEmitter {
     }
 
     this.fpsWindowFrames += 1;
+    this.fpsWindowBytes += frame.length;
     if (!this.fpsWindowStart) this.fpsWindowStart = now;
     else if (now - this.fpsWindowStart >= 1000) {
-      this.deliveredFps = (this.fpsWindowFrames * 1000) / (now - this.fpsWindowStart);
+      const elapsed = now - this.fpsWindowStart;
+      this.deliveredFps = (this.fpsWindowFrames * 1000) / elapsed;
+      this.deliveredBps = (this.fpsWindowBytes * 1000) / elapsed;
       this.fpsWindowFrames = 0;
+      this.fpsWindowBytes = 0;
       this.fpsWindowStart = now;
     }
 
     this.frameSizeEma = this.frameSizeEma ? this.frameSizeEma * 0.9 + frame.length * 0.1 : frame.length;
-    if (!this.qualityLocked && now - this.lastQualityChange > 5000) {
-      const targetFps = this.config.screencastFps || 30;
-      // Byte budget scales with the capture area: a 1920-wide frame has 2.25x the
-      // pixels of a 1280-wide one and should not be held to the same size.
-      const pixels = this.viewport.width * this.viewport.height;
-      const budget = 55_000 * Math.max(0.5, Math.min(2.4, pixels / (1280 * 800)));
-      // Wide gap between the two thresholds: an encoder hovering at exactly the
-      // target rate must not flip quality (and restart the screencast) forever.
-      const struggling = this.deliveredFps > 0 && this.deliveredFps < targetFps * 0.8;
-      const comfortable = !this.deliveredFps || this.deliveredFps >= targetFps * 0.95;
+    // Bandwidth is what a remote viewer actually feels: 30 frames of 100 KB is
+    // 24 Mbps, which a small VPS uplink cannot carry, so frames queue and then
+    // get dropped, which reads as laggy video. Keep the byte rate under the
+    // configured budget by lowering quality first and resolution second.
+    if (!this.qualityLocked && now - this.lastQualityChange > 8000) {
+      const cap = (this.config.streamMaxKbps * 1000) / 8;
+      const rate = this.deliveredBps;
+      const configFps = this.config.screencastFps || 30;
       let next = this.quality;
-      if (struggling || this.frameSizeEma > budget * 2) next = Math.max(32, this.quality - 7);
-      // Raising never goes above the configured FRAME_QUALITY: adaptation is for
-      // protecting frame rate, not for quietly spending more bandwidth than the
-      // operator asked for.
-      else if (comfortable && this.frameSizeEma < budget * 0.6) {
-        next = Math.min(this.config.frameQuality, this.quality + 3);
+      let nextScale = this.scale;
+      let nextRate = this.frameRate;
+      if (rate > cap) {
+        // Quality first (still legible at 40), then frame rate, and only then
+        // capture resolution. Wide thresholds keep it from oscillating.
+        if (this.quality > 40) next = Math.max(40, this.quality - 8);
+        else if (nextRate > 20) nextRate = 20;
+        else if (nextScale > 0.7) nextScale = Math.max(0.7, Math.round((nextScale - 0.15) * 100) / 100);
+      } else if (rate > 0 && rate < cap * 0.45) {
+        if (nextScale < 1) nextScale = Math.min(1, Math.round((nextScale + 0.15) * 100) / 100);
+        else if (next < this.config.frameQuality) next = Math.min(this.config.frameQuality, this.quality + 4);
+        else if (nextRate < configFps) nextRate = configFps;
       }
-      if (Math.abs(next - this.quality) >= 3) {
+      // A restart re-encodes from scratch, so only significant, infrequent
+      // changes are worth one.
+      if (
+        Math.abs(next - this.quality) >= 6 ||
+        Math.abs(nextScale - this.scale) >= 0.1 ||
+        nextRate !== this.frameRate
+      ) {
+        log.debug(
+          'stream tuned',
+          this.id,
+          `quality ${this.quality}->${next}`,
+          `scale ${this.scale.toFixed(2)}->${nextScale.toFixed(2)}`,
+          `fps ${this.frameRate}->${nextRate}`,
+          `rate ${Math.round(rate / 1000)}/${Math.round(cap / 1000)}KBps actual ${Math.round(this.deliveredFps)}`,
+        );
         this.quality = next;
+        this.scale = Math.round(nextScale * 100) / 100;
+        this.frameRate = nextRate;
+        this.frameSkip = Math.max(1, Math.round(60 / nextRate));
         this.lastQualityChange = now;
         this.restartStreaming().catch(() => {});
       }
@@ -684,6 +767,7 @@ export class TabSession extends EventEmitter {
     const quality = clamp(value, 25, 85);
     if (Math.abs(quality - this.quality) < 2) return;
     this.quality = quality;
+    this.scale = 1;
     this.qualityLocked = true;
     this.lastQualityChange = Date.now();
     this.restartStreaming().catch(() => {});

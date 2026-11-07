@@ -98,6 +98,11 @@ export const config = Object.freeze({
   idlePollMs: integer(process.env.IDLE_POLL_MS, 5000, 1000, 60000),
   navTimeoutMs: integer(process.env.NAV_TIMEOUT_MS, 45000, 5000, 180000),
   frameQuality: integer(process.env.FRAME_QUALITY, 62, 20, 90),
+  // What the stream is allowed to spend on the wire. Thirty 100 KB frames a
+  // second is 24 Mbps, which saturates a small VPS uplink and arrives as bursts
+  // rather than smooth video. Quality drops first, then capture resolution, to
+  // stay under this.
+  streamMaxKbps: integer(process.env.STREAM_MAX_KBPS, 12000, 1000, 50000),
   viewportMaxWidth: integer(process.env.VIEWPORT_MAX_WIDTH, 1920, 640, 2560),
   viewportMaxHeight: integer(process.env.VIEWPORT_MAX_HEIGHT, 1200, 480, 1600),
 

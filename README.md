@@ -236,6 +236,7 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `CHROMIUM_SINGLE_PROCESS` | `0` | Adds `--single-process`. Off by default: Chromium does not support single-process browsing, and it disables site isolation and the renderer sandbox. |
 | `NAV_TIMEOUT_MS` | `45000` | Navigation timeout. |
 | `FRAME_QUALITY` | `62` | Initial JPEG quality (1–90), adapts to back-pressure. |
+| `STREAM_MAX_KBPS` | `12000` | Bandwidth cap for one tab's stream. Above it the capture resolution drops in steps to 70%, then JPEG quality. Thirty 100 KB frames a second is 24 Mbps, which saturates a small VPS uplink and arrives in bursts instead of smooth video. |
 | `VIEWPORT_MAX_WIDTH/HEIGHT` | `1920` / `1200` | Caps for the remote viewport. |
 | `BROWSER_MODE` | `headless` | `headless` or `headed` (needs X/xvfb). |
 | `CHROMIUM_PATH` | – | Use a system Chromium instead of Playwright's build. |
