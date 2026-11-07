@@ -130,7 +130,11 @@ export function attachWebSocketServer(server, { auth, manager, limiter, audio })
       },
       sendFrame(packet) {
         if (ws.readyState !== WebSocket.OPEN) return;
-        if (ws.bufferedAmount > 1_500_000) return; // do not queue stale video frames
+        // A frame that has to wait behind a megabyte of other frames is already
+        // stale; queueing it only converts bandwidth trouble into seconds of
+        // input-to-picture lag. Roughly two JPEGs of slack keeps the stream live
+        // (the client drops the older frame anyway).
+        if (ws.bufferedAmount > 350_000) return;
         try {
           ws.send(packet, { binary: true });
         } catch {

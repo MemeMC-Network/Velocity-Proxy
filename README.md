@@ -305,9 +305,12 @@ journalctl -u velocity-proxy -f
   `TabSession.setMuted()` mutes every `audio`/`video` element in the page (and re-applies it on
   play), so background tabs stay silent without a per-tab mixer.
 - **Frames.** The active tab runs `Page.startScreencast`; frames are packed as
-  `magic "VXFP" (0x56584650) | version 1 | id length | tab id | JPEG` and sent over the tab's single
-  WebSocket. The client decodes with `createImageBitmap` and draws to canvas; only the active tab
-  streams, so switching tabs costs no reload.
+  `magic "VXFP" (0x56584650) | version 3 | id length | width | height | capture ms | tab id | JPEG`
+  and sent over the tab's single WebSocket. The capture time lets the client report true
+  capture-to-paint lag in the performance panel; frames are dropped once a socket has ~350 kB queued
+  rather than letting a slow link accumulate seconds of stale video. The client decodes with
+  `createImageBitmap` and draws 1:1 to canvas; only the active tab streams, so switching tabs costs
+  no reload.
 - **Input.** Pointer, wheel and key events are translated to CDP `Input.*` calls with the canvas
   scaling factored in. Text uses `Input.insertText`; special keys use a US-layout code map.
   Popups (`window.open`, `target=_blank`) are adopted as new proxy tabs — the real browser window

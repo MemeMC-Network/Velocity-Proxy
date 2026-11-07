@@ -74,6 +74,8 @@ const renderLive = () => {
     metric('FPS', stats.fps ? `${stats.fps}` : '—'),
     metric('Frame decode', stats.painted ? `${stats.decodeMs.toFixed(1)} ms` : '—'),
     metric('Dropped frames', dropped),
+    metric('Stream lag', stats.lagMs != null ? `${stats.lagMs} ms` : '—'),
+    metric('Stream rate', stats.kbps ? `${stats.kbps} kbps` : '—'),
     metric('Round trip', state.latency != null ? `${state.latency} ms` : '—'),
     metric('Audio buffer', audio.available ? `${audio.latencyMs ?? 0} ms` : '—'),
     metric('Audio path', audio.available ? (audio.transport === 'pcm' ? 'PCM' : 'Opus') : '—'),

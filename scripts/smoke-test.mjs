@@ -349,15 +349,18 @@ try {
 
     const frame = await framePromise;
     assert.equal(frame.readUInt32BE(0), 0x56584650, 'frame magic');
-    assert.equal(frame.readUInt8(4), 2, 'frame version');
+    const version = frame.readUInt8(4);
+    assert.ok(version >= 3, 'frame version carries the capture time');
     const idLength = frame.readUInt8(5);
+    const headerLength = 14;
     const frameWidth = frame.readUInt16BE(6);
     const frameHeight = frame.readUInt16BE(8);
-    assert.equal(frame.toString('utf8', 10, 10 + idLength), tabId);
+    assert.ok(frame.readUInt32BE(10) > 0, 'frame carries a server capture time');
+    assert.equal(frame.toString('utf8', headerLength, headerLength + idLength), tabId);
     assert.ok(frameWidth >= 320 && frameHeight >= 240, 'frame carries its pixel size');
-    assert.ok(frame.length > 10 + idLength + 500, 'frame contains JPEG data');
-    assert.equal(frame[10 + idLength], 0xff, 'JPEG SOI marker');
-    assert.equal(frame[11 + idLength], 0xd8, 'JPEG SOI marker');
+    assert.ok(frame.length > headerLength + idLength + 500, 'frame contains JPEG data');
+    assert.equal(frame[headerLength + idLength], 0xff, 'JPEG SOI marker');
+    assert.equal(frame[headerLength + idLength + 1], 0xd8, 'JPEG SOI marker');
   });
 
   await check('page title is tracked from the live DOM', async () => {

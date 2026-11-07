@@ -550,6 +550,15 @@ body[data-home-bg="upload"] .newtab::before {
 
 .nt-hero { gap: 18px; margin-top: 12px; }
 
+/* The search field blurs its backdrop, which makes it a stacking context. With
+   z-index auto its dropdown could not paint above the shortcuts and history
+   sections that follow it (they won on document order), so suggestion icons
+   showed through the panel and clicks landed on the tiles instead. */
+.nt-search {
+  position: relative;
+  z-index: 3;
+}
+
 .nt-headline {
   font-size: clamp(32px, 4.6vw, 50px);
   letter-spacing: -0.035em;
@@ -707,8 +716,9 @@ kbd {
 .suggest-panel {
   border-radius: 11px;
   border-color: var(--line-strong);
-  background: color-mix(in srgb, var(--surface-2) 96%, transparent);
-  backdrop-filter: blur(18px);
+  /* Opaque: a translucent dropdown showed the shortcuts and history behind it
+     through the panel, which read as duplicated rows. */
+  background: var(--surface-2);
   box-shadow: var(--shadow-lg);
   padding: 5px;
 }
@@ -1130,7 +1140,7 @@ kbd {
 
 .perf-strip {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(122px, 1fr));
   gap: 6px;
   margin: 2px 0 14px;
 }
@@ -1190,10 +1200,9 @@ kbd {
 .suggest-panel,
 .modal-card,
 .palette {
-  background: color-mix(in srgb, var(--surface-2) 97%, transparent);
+  background: var(--surface-2);
   border-color: var(--line-strong);
   box-shadow: var(--shadow-lg);
-  backdrop-filter: blur(20px);
 }
 
 .modal-card { border-radius: 14px; }

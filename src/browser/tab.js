@@ -51,13 +51,15 @@ export class TabSession extends EventEmitter {
     this.page = page;
     this.config = config;
 
-    // One reusable frame header: the id never changes, only the pixel size.
+    // One reusable frame header: the id never changes, only the pixel size and
+    // the capture time. Version 3 adds a 4-byte server timestamp at offset 10,
+    // so the client can report real end-to-end stream lag instead of guessing.
     const idBuffer = Buffer.from(String(id), 'utf8').subarray(0, 32);
-    this.frameHeader = Buffer.alloc(10 + idBuffer.length);
+    this.frameHeader = Buffer.alloc(14 + idBuffer.length);
     this.frameHeader.writeUInt32BE(MAGIC, 0);
-    this.frameHeader.writeUInt8(2, 4);
+    this.frameHeader.writeUInt8(3, 4);
     this.frameHeader.writeUInt8(idBuffer.length, 5);
-    idBuffer.copy(this.frameHeader, 10);
+    idBuffer.copy(this.frameHeader, 14);
     this.historyUrl = null;
 
     this.clients = new Set();
@@ -101,6 +103,12 @@ export class TabSession extends EventEmitter {
     this.frameSizeEma = 0;
     this.lastQualityChange = 0;
     this.lastFrameSentAt = 0;
+    // What the encoder actually sustains. A page with constant damage can make
+    // Chromium's JPEG encoding the bottleneck, and raising quality then costs
+    // frames, which is exactly what reads as lag.
+    this.fpsWindowStart = 0;
+    this.fpsWindowFrames = 0;
+    this.deliveredFps = 0;
 
     this.muted = Boolean(meta.muted);
     this.audible = false;
@@ -556,10 +564,13 @@ export class TabSession extends EventEmitter {
     const viewers = this.viewers();
     if (!viewers.length) return;
 
-    // Chromium emits on damage, often faster than a browser view can use. Drop
-    // the extra captures before packetising them (SCREENCAST_FPS).
+    // Chromium already skips frames (everyNthFrame, set from SCREENCAST_FPS), so
+    // this gate is only a safety net for a page that emits damage in bursts. It
+    // must not run at the same threshold as everyNthFrame: arrival jitter of a
+    // millisecond or two would then drop perfectly good frames and halve the
+    // rate, which reads as lag. A quarter of a frame of slack is enough.
     const now = Date.now();
-    const minInterval = 1000 / (this.config.screencastFps || 60);
+    const minInterval = (1000 / (this.config.screencastFps || 30)) * 0.75;
     if (now - this.lastFrameSentAt < minInterval) return;
     this.lastFrameSentAt = now;
 
@@ -571,6 +582,7 @@ export class TabSession extends EventEmitter {
     const header = this.frameHeader;
     header.writeUInt16BE(width, 6);
     header.writeUInt16BE(height, 8);
+    header.writeUInt32BE(now >>> 0, 10);
     // One allocation and two copies per frame instead of Buffer.concat, which
     // allocated twice and copied the JPEG twice at ~30 frames/second/tab.
     const packet = Buffer.allocUnsafe(header.length + frame.length);
@@ -594,11 +606,33 @@ export class TabSession extends EventEmitter {
       }
     }
 
+    this.fpsWindowFrames += 1;
+    if (!this.fpsWindowStart) this.fpsWindowStart = now;
+    else if (now - this.fpsWindowStart >= 1000) {
+      this.deliveredFps = (this.fpsWindowFrames * 1000) / (now - this.fpsWindowStart);
+      this.fpsWindowFrames = 0;
+      this.fpsWindowStart = now;
+    }
+
     this.frameSizeEma = this.frameSizeEma ? this.frameSizeEma * 0.9 + frame.length * 0.1 : frame.length;
     if (!this.qualityLocked && now - this.lastQualityChange > 5000) {
+      const targetFps = this.config.screencastFps || 30;
+      // Byte budget scales with the capture area: a 1920-wide frame has 2.25x the
+      // pixels of a 1280-wide one and should not be held to the same size.
+      const pixels = this.viewport.width * this.viewport.height;
+      const budget = 55_000 * Math.max(0.5, Math.min(2.4, pixels / (1280 * 800)));
+      // Wide gap between the two thresholds: an encoder hovering at exactly the
+      // target rate must not flip quality (and restart the screencast) forever.
+      const struggling = this.deliveredFps > 0 && this.deliveredFps < targetFps * 0.8;
+      const comfortable = !this.deliveredFps || this.deliveredFps >= targetFps * 0.95;
       let next = this.quality;
-      if (this.frameSizeEma > 240000) next = Math.max(32, this.quality - 8);
-      else if (this.frameSizeEma < 70000) next = Math.min(78, this.quality + 3);
+      if (struggling || this.frameSizeEma > budget * 2) next = Math.max(32, this.quality - 7);
+      // Raising never goes above the configured FRAME_QUALITY: adaptation is for
+      // protecting frame rate, not for quietly spending more bandwidth than the
+      // operator asked for.
+      else if (comfortable && this.frameSizeEma < budget * 0.6) {
+        next = Math.min(this.config.frameQuality, this.quality + 3);
+      }
       if (Math.abs(next - this.quality) >= 3) {
         this.quality = next;
         this.lastQualityChange = now;

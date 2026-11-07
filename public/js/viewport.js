@@ -22,8 +22,13 @@ let zoom = 1;
 let frameSize = null;
 let contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
 let pendingBitmap = null;
+let pendingCaptureTs = null;
 let paintScheduled = false;
 let paintedRect = null;
+// Server clock minus this clock, estimated from ping/pong round trips. The
+// stream carries server capture times, so this is what turns them into lag.
+// Null until the first pong: skew would otherwise look like lag.
+let clockOffset = null;
 
 // Live renderer counters for the performance panel. Cheap increments only.
 const stats = {
@@ -33,8 +38,11 @@ const stats = {
   decodeMs: 0,
   lastDecodeMs: 0,
   fps: 0,
+  lagMs: null,
+  kbps: 0,
   windowStart: 0,
   windowPainted: 0,
+  windowBytes: 0,
 };
 
 export const viewportStats = () => ({
@@ -43,6 +51,8 @@ export const viewportStats = () => ({
   dropped: stats.dropped,
   decodeMs: Math.round(stats.lastDecodeMs * 100) / 100,
   fps: stats.fps,
+  lagMs: stats.lagMs,
+  kbps: stats.kbps,
   width: dom.canvas ? dom.canvas.width : 0,
   height: dom.canvas ? dom.canvas.height : 0,
   zoom,
@@ -117,8 +127,21 @@ export const initViewport = ({ send }) => {
     resizeTimer = setTimeout(() => applySize(), 60);
   });
 
+  connection.addEventListener('pong', (event) => {
+    const { serverTime, ts } = event.detail || {};
+    if (!Number.isFinite(serverTime) || !Number.isFinite(ts)) return;
+    const now = Date.now();
+    // Half the round trip is the one-way delay; the rest of the difference is
+    // the offset between the two clocks. Only the smallest sample is kept: a
+    // pong delayed by a busy connection would otherwise inflate the offset and
+    // make the stream look better than it is.
+    const sample = serverTime - (ts + (now - ts) / 2);
+    clockOffset = clockOffset == null ? sample : Math.min(clockOffset, sample);
+  });
+
   connection.addEventListener('status', (event) => {
     const status = event.detail.status;
+    if (status === 'open') clockOffset = null;
     if (status === 'offline' || status === 'connecting') {
       if (currentTabId) showOffline();
     } else if (status === 'open') {
@@ -299,7 +322,10 @@ const applySize = () => {
   const rect = dom.viewer.getBoundingClientRect();
   const cssWidth = Math.max(320, Math.round(rect.width));
   const cssHeight = Math.max(240, Math.round(rect.height));
-  const ratio = Math.min(2, window.devicePixelRatio || 1);
+  // The screencast is captured at CSS size, so a 2x backing store only upscaled
+  // a 1x image: it cost four times the canvas memory and a bigger drawImage per
+  // frame for no extra detail. 1:1 is both sharper and cheaper.
+  const ratio = 1;
   const bufferWidth = Math.round(cssWidth * ratio);
   const bufferHeight = Math.round(cssHeight * ratio);
   if (dom.canvas.width !== bufferWidth || dom.canvas.height !== bufferHeight) {
@@ -379,8 +405,10 @@ const drawFrame = async (buffer) => {
   if (view.getUint32(0) !== MAGIC) return;
   const version = view.getUint8(4);
   const idLength = view.getUint8(5);
-  const sized = version >= 2 && buffer.byteLength >= 10 + idLength;
-  const idOffset = sized ? 10 : 6;
+  // v2 added the frame's pixel size, v3 the server capture time.
+  const headerLength = version >= 3 ? 14 : 10;
+  const sized = version >= 2 && buffer.byteLength >= headerLength + idLength;
+  const idOffset = sized ? headerLength : 6;
   let tabId = '';
   try {
     tabId = new TextDecoder().decode(new Uint8Array(buffer, idOffset, idLength));
@@ -393,10 +421,12 @@ const drawFrame = async (buffer) => {
     const height = view.getUint16(8);
     if (width && height) frameSize = { width, height };
   }
+  const captureTs = version >= 3 ? view.getUint32(10) : null;
 
   const jpeg = new Uint8Array(buffer, idOffset + idLength);
   const blob = new Blob([jpeg], { type: 'image/jpeg' });
   stats.frames += 1;
+  stats.windowBytes += buffer.byteLength;
   const decodeStart = performance.now();
   let bitmap = null;
   if (typeof createImageBitmap === 'function') {
@@ -412,7 +442,7 @@ const drawFrame = async (buffer) => {
     bitmap.close();
     return;
   }
-  schedulePaint(bitmap);
+  schedulePaint(bitmap, captureTs);
 };
 
 /**
@@ -420,12 +450,13 @@ const drawFrame = async (buffer) => {
  * only the newest one is worth showing. The previous bitmap is released here so
  * a burst does not pile up GPU memory.
  */
-const schedulePaint = (bitmap) => {
+const schedulePaint = (bitmap, captureTs = null) => {
   if (pendingBitmap) {
     pendingBitmap.close();
     stats.dropped += 1;
   }
   pendingBitmap = bitmap;
+  pendingCaptureTs = captureTs;
   if (paintScheduled) return;
   paintScheduled = true;
   requestAnimationFrame(paintPending);
@@ -434,7 +465,9 @@ const schedulePaint = (bitmap) => {
 const paintPending = () => {
   paintScheduled = false;
   const bitmap = pendingBitmap;
+  const captureTs = pendingCaptureTs;
   pendingBitmap = null;
+  pendingCaptureTs = null;
   if (!bitmap) return;
   if (!dom.ctx || !currentTabId) {
     bitmap.close();
@@ -460,11 +493,24 @@ const paintPending = () => {
   hasFrame = true;
   stats.painted += 1;
   stats.windowPainted += 1;
+  // Capture-to-paint age: encoder time, network transit and decode together.
+  // The timestamp is 32 bits and wraps every 49 days, so the difference is
+  // folded back into a signed range before it is believed.
+  if (captureTs != null && clockOffset != null) {
+    // The timestamp is modulo 2^32, so the difference is taken modulo 2^32 too
+    // and then folded into a signed range before it is believed.
+    let age = ((Date.now() + clockOffset - captureTs) % 4294967296 + 4294967296) % 4294967296;
+    if (age > 2147483647) age -= 4294967296;
+    stats.lagMs = Math.max(0, Math.round(age));
+  }
   const now = performance.now();
   if (!stats.windowStart) stats.windowStart = now;
   if (now - stats.windowStart >= 1000) {
-    stats.fps = Math.round((stats.windowPainted * 1000) / (now - stats.windowStart));
+    const elapsed = now - stats.windowStart;
+    stats.fps = Math.round((stats.windowPainted * 1000) / elapsed);
+    stats.kbps = Math.round((stats.windowBytes * 8) / elapsed);
     stats.windowPainted = 0;
+    stats.windowBytes = 0;
     stats.windowStart = now;
   }
   if (overlayMode === 'loading') hideOverlay();
