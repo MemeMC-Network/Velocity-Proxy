@@ -1,5 +1,8 @@
 const SETTINGS_KEY = 'velocity.settings.v1';
 const SHORTCUTS_KEY = 'velocity.shortcuts.v1';
+const BOOKMARKS_KEY = 'velocity.bookmarks.v1';
+const LAYOUT_KEY = 'velocity.layout.v1';
+const SPACES_KEY = 'velocity.spaces.v1';
 
 export const DEFAULT_SHORTCUTS = [
   { title: 'YouTube', url: 'https://www.youtube.com/' },
@@ -33,17 +36,66 @@ const write = (key, value) => {
 
 const defaults = {
   theme: 'dark',
+  accent: 'ember',
   engine: 'google',
   customTemplate: '',
   quality: 62,
   volume: 0.8,
   muted: false,
   zoom: 1,
+  startup: 'restore',
+  homeClock: true,
+  homeGreeting: true,
+  homeRecent: true,
+  homeFrequent: true,
+  homeBookmarks: true,
+  homeBg: 'none',
+  homeBgUrl: '',
+  homeImage: '',
+  bookmarksBar: true,
+  bookmarksNewTab: false,
+  tabGroups: true,
+  tabCloseAlways: false,
+  reduceMotion: false,
+  historyEnabled: true,
+  audioAutostart: true,
+};
+
+const layoutDefaults = { order: [], groups: {}, titles: {} };
+
+const readLayout = () => {
+  const raw = read(LAYOUT_KEY, null);
+  if (!raw) return { ...layoutDefaults };
+  return {
+    order: Array.isArray(raw.order) ? raw.order.filter((id) => typeof id === 'string') : [],
+    groups: raw.groups && typeof raw.groups === 'object' ? raw.groups : {},
+    titles: raw.titles && typeof raw.titles === 'object' ? raw.titles : {},
+  };
+};
+
+const readBookmarks = () => {
+  const raw = read(BOOKMARKS_KEY, null);
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item) => item && typeof item.url === 'string')
+    .map((item, index) => ({
+      id: typeof item.id === 'string' ? item.id : `bm-${index}-${Date.now()}`,
+      title: typeof item.title === 'string' ? item.title : item.url,
+      url: item.url,
+      folder: typeof item.folder === 'string' ? item.folder : '',
+      createdAt: Number(item.createdAt) || Date.now(),
+    }));
 };
 
 export const state = {
   settings: { ...defaults, ...read(SETTINGS_KEY, {}) },
   shortcuts: Array.isArray(read(SHORTCUTS_KEY, null)) ? read(SHORTCUTS_KEY, []) : DEFAULT_SHORTCUTS.slice(),
+  bookmarks: readBookmarks(),
+  layout: readLayout(),
+  spaces: (() => {
+    const raw = read(SPACES_KEY, null);
+    return Array.isArray(raw) ? raw.filter((space) => space && Array.isArray(space.tabs)) : [];
+  })(),
   tabs: new Map(),
   order: [],
   activeId: null,
@@ -65,6 +117,12 @@ export const saveSettings = () => write(SETTINGS_KEY, state.settings);
 
 export const saveShortcuts = () => write(SHORTCUTS_KEY, state.shortcuts);
 
+export const saveBookmarks = () => write(BOOKMARKS_KEY, state.bookmarks);
+
+export const saveLayout = () => write(LAYOUT_KEY, state.layout);
+
+export const saveSpaces = () => write(SPACES_KEY, state.spaces);
+
 export const engineName = (id = state.settings.engine) =>
   state.engines.find((engine) => engine.id === id)?.name || 'Custom';
 
@@ -78,7 +136,158 @@ export const engineSearchTemplate = (id = state.settings.engine) => {
 
 export const orderedTabs = () => {
   const tabs = state.order.map((id) => state.tabs.get(id)).filter(Boolean);
-  return [...tabs.filter((tab) => tab.pinned), ...tabs.filter((tab) => !tab.pinned)];
+  const rank = (tab) => {
+    const index = state.layout.order.indexOf(tab.id);
+    return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+  };
+  const byLayout = (a, b) => rank(a) - rank(b) || state.order.indexOf(a.id) - state.order.indexOf(b.id);
+  return [...tabs.filter((tab) => tab.pinned).sort(byLayout), ...tabs.filter((tab) => !tab.pinned).sort(byLayout)];
+};
+
+/* --------------------------------------------------------------- bookmarks */
+
+export const bookmarkId = () => `bm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+
+const normalizeBookmarkUrl = (url) => normalizeUrl(url);
+
+export const findBookmark = (url) =>
+  url ? state.bookmarks.find((item) => normalizeBookmarkUrl(item.url) === normalizeBookmarkUrl(url)) || null : null;
+
+export const addBookmark = ({ title, url, folder = '' }) => {
+  if (!url || findBookmark(url)) return null;
+  const bookmark = { id: bookmarkId(), title: title || shortcutHost(url), url, folder, createdAt: Date.now() };
+  state.bookmarks = [bookmark, ...state.bookmarks];
+  saveBookmarks();
+  return bookmark;
+};
+
+export const updateBookmark = (id, patch) => {
+  const bookmark = state.bookmarks.find((item) => item.id === id);
+  if (!bookmark) return null;
+  Object.assign(bookmark, patch);
+  saveBookmarks();
+  return bookmark;
+};
+
+export const removeBookmark = (id) => {
+  const before = state.bookmarks.length;
+  state.bookmarks = state.bookmarks.filter((item) => item.id !== id);
+  if (state.bookmarks.length !== before) saveBookmarks();
+};
+
+export const reorderBookmarks = (ids) => {
+  const byId = new Map(state.bookmarks.map((item) => [item.id, item]));
+  const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
+  const rest = state.bookmarks.filter((item) => !ids.includes(item.id));
+  state.bookmarks = [...ordered, ...rest];
+  saveBookmarks();
+};
+
+export const bookmarkFolders = () =>
+  [...new Set(state.bookmarks.map((item) => item.folder).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+
+/* ------------------------------------------------------------- tab layout */
+
+export const GROUP_COLORS = ['#e3b183', '#a9c6a3', '#93b8e8', '#b6a6ef', '#d98b8b', '#8fbfa0'];
+
+export const groupsList = () =>
+  Object.values(state.layout.groups).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+
+export const groupOfTab = (tabId) => {
+  const groupId = state.layout.groups && Object.keys(state.layout.groups).find(
+    (id) => Array.isArray(state.layout.groups[id].tabs) && state.layout.groups[id].tabs.includes(tabId),
+  );
+  return groupId ? state.layout.groups[groupId] : null;
+};
+
+export const createGroup = (name, color) => {
+  const id = `grp-${Date.now().toString(36)}`;
+  state.layout.groups[id] = {
+    id,
+    name: name || 'Group',
+    color: color || GROUP_COLORS[groupsList().length % GROUP_COLORS.length],
+    collapsed: false,
+    tabs: [],
+    createdAt: Date.now(),
+  };
+  saveLayout();
+  return state.layout.groups[id];
+};
+
+export const assignTabToGroup = (tabId, groupId) => {
+  for (const group of Object.values(state.layout.groups)) {
+    group.tabs = (group.tabs || []).filter((id) => id !== tabId);
+  }
+  if (groupId && state.layout.groups[groupId]) {
+    state.layout.groups[groupId].tabs.push(tabId);
+  }
+  saveLayout();
+};
+
+export const removeGroup = (groupId) => {
+  delete state.layout.groups[groupId];
+  saveLayout();
+};
+
+export const toggleGroupCollapsed = (groupId) => {
+  const group = state.layout.groups[groupId];
+  if (!group) return;
+  group.collapsed = !group.collapsed;
+  saveLayout();
+};
+
+export const pruneLayout = (ids) => {
+  const live = new Set(ids);
+  let changed = false;
+  state.layout.order = state.layout.order.filter((id) => live.has(id));
+  for (const id of Object.keys(state.layout.titles)) {
+    if (!live.has(id)) {
+      delete state.layout.titles[id];
+      changed = true;
+    }
+  }
+  for (const group of Object.values(state.layout.groups)) {
+    const next = (group.tabs || []).filter((id) => live.has(id));
+    if (next.length !== (group.tabs || []).length) {
+      group.tabs = next;
+      changed = true;
+    }
+  }
+  if (changed) saveLayout();
+};
+
+export const setTabOrder = (ids) => {
+  state.layout.order = [...ids];
+  saveLayout();
+};
+
+export const setTabTitle = (tabId, title) => {
+  if (title) state.layout.titles[tabId] = title;
+  else delete state.layout.titles[tabId];
+  saveLayout();
+};
+
+export const tabDisplayTitle = (tab, fallback) =>
+  (tab && state.layout.titles[tab.id]) || fallback || (tab ? tab.title : '') || 'New Tab';
+
+/* ---------------------------------------------------------------- spaces */
+
+export const saveSpace = (name, tabs) => {
+  if (!name || !tabs.length) return null;
+  const space = {
+    id: `space-${Date.now().toString(36)}`,
+    name: name.slice(0, 60),
+    createdAt: Date.now(),
+    tabs: tabs.slice(0, 20).map((tab) => ({ url: tab.url || tab.lastUrl || '', title: tab.title || '' })).filter((tab) => tab.url),
+  };
+  state.spaces = [space, ...state.spaces].slice(0, 20);
+  saveSpaces();
+  return space;
+};
+
+export const removeSpace = (id) => {
+  state.spaces = state.spaces.filter((space) => space.id !== id);
+  saveSpaces();
 };
 
 export const activeTab = () => (state.activeId ? state.tabs.get(state.activeId) || null : null);

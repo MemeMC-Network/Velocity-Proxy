@@ -219,6 +219,9 @@ export class WorkspaceManager {
     const headless = this.config.browserMode === 'headless';
     const args = [
       '--disable-dev-shm-usage',
+      // Opt-in only: Chromium does not support single-process browsing, and it
+      // removes the renderer sandbox and site isolation.
+      ...(this.config.chromiumSingleProcess ? ['--single-process'] : []),
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-background-timer-throttling',
@@ -251,6 +254,11 @@ export class WorkspaceManager {
       ...(this.config.chromiumJsHeapMb > 0
         ? [`--js-flags=--max-old-space-size=${this.config.chromiumJsHeapMb}`]
         : []),
+      // Audio is captured from this browser's output, so its output buffer is
+      // latency the viewer hears. Chromium clamps the value to 512-8192 frames.
+      ...(this.config.chromiumAudioBuffer > 0
+        ? [`--audio-buffer-size=${this.config.chromiumAudioBuffer}`]
+        : []),
       ...this.config.chromiumArgs,
     ];
     const base = {
@@ -272,11 +280,17 @@ export class WorkspaceManager {
 
     const sandboxPreference = this.config.chromiumSandbox;
     const wantSandbox = sandboxPreference === 'on' || (sandboxPreference === 'auto' && !this.config.isRoot);
+    if (this.config.chromiumSingleProcess) {
+      log.warn(
+        'CHROMIUM_SINGLE_PROCESS is on: pages share one process and the renderer sandbox and site isolation are off',
+      );
+    }
 
     const attempt = async (sandbox, candidate) => {
       const browser = await chromium.launch({
         ...base,
-        chromiumSandbox: sandbox,
+        // Chromium refuses the sandbox in single-process mode.
+        chromiumSandbox: sandbox && !this.config.chromiumSingleProcess,
         ...(candidate.channel ? { channel: candidate.channel } : {}),
       });
       this.browserVersion = browser.version();
@@ -660,6 +674,7 @@ class Workspace {
     this.records = new Map();
     this.order = [];
     this.history = [];
+    this.historyEnabled = true;
     this.clients = new Set();
     this.lastActiveAt = Date.now();
     this.activeRecordId = null;
@@ -698,6 +713,7 @@ class Workspace {
             .filter((entry) => entry && typeof entry.url === 'string' && /^https?:/.test(entry.url))
             .slice(0, HISTORY_LIMIT)
         : [];
+      this.historyEnabled = data.historyEnabled !== false;
       this.activeRecordId =
         typeof data.activeTabId === 'string' && this.records.has(data.activeTabId) ? data.activeTabId : null;
     } catch {
@@ -731,6 +747,7 @@ class Workspace {
         lastUsedAt: record.lastUsedAt,
       })),
       history: this.history.slice(0, HISTORY_LIMIT),
+      historyEnabled: this.historyEnabled,
     };
     const temporary = `${this.filePath}.tmp`;
     await fs.writeFile(temporary, JSON.stringify(payload), { mode: 0o600 });
@@ -1099,6 +1116,7 @@ class Workspace {
   /* ---------------------------------------------------------------- history */
 
   addHistory({ url, title }) {
+    if (!this.historyEnabled) return;
     if (!url || !/^https?:/.test(url)) return;
     const host = hostOf(url);
     if (!host) return;
@@ -1128,6 +1146,23 @@ class Workspace {
   clearHistory() {
     this.history = [];
     this.save();
-    this.broadcast({ t: 'history', items: [] });
+    this.broadcast({ t: 'history', items: [], enabled: this.historyEnabled });
+  }
+
+  /** Removes one visited URL; returns whether anything changed. */
+  removeHistory(url) {
+    const before = this.history.length;
+    this.history = this.history.filter((entry) => entry.url !== url);
+    if (this.history.length === before) return false;
+    this.save();
+    this.broadcast({ t: 'history', items: this.historySnapshot(), enabled: this.historyEnabled });
+    return true;
+  }
+
+  setHistoryEnabled(enabled) {
+    this.historyEnabled = Boolean(enabled);
+    this.save();
+    this.broadcast({ t: 'history', items: this.historySnapshot(), enabled: this.historyEnabled });
+    return this.historyEnabled;
   }
 }

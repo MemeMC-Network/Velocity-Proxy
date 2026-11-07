@@ -544,7 +544,7 @@ try {
     await unmuted;
   });
 
-  await check('audio streams live Opus/WebM over an authenticated socket', async () => {
+  await check('audio streams live PCM or Opus over an authenticated socket', async () => {
     const info = await (await fetch(`${origin}/api/audio`, { headers: { cookie } })).json();
     assert.equal(info.enabled, true);
     if (info.status === 'unavailable') {
@@ -567,8 +567,14 @@ try {
         });
         socket.once('error', reject);
       });
-      const head = Buffer.concat(chunks).subarray(0, 4);
-      assert.equal(head.readUInt32BE(0), 0x1a45dfa3, 'WebM/EBML header');
+      const audio = Buffer.concat(chunks);
+      if (info.transport === 'pcm') {
+        assert.equal(info.format?.encoding, 'pcm_s16le');
+        assert.equal(audio.length % 4, 0, '16-bit stereo frame alignment');
+        assert.ok(audio.some((byte) => byte !== 0), 'non-silent samples');
+      } else {
+        assert.equal(audio.readUInt32BE(0), 0x1a45dfa3, 'WebM/EBML header');
+      }
     } finally {
       socket.close();
     }

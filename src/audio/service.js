@@ -3,7 +3,13 @@ import { log } from '../logger.js';
 import { shortHash } from '../util.js';
 
 const MAX_BUFFERED = 1_200_000;
+// Raw PCM is ~192 kB/s, so a lagging listener can fall behind much faster.
+const MAX_PCM_BUFFERED = 384_000;
 const IDLE_STOP_MS = 12_000;
+const PCM_SAMPLE_RATE = 48000;
+const PCM_CHANNELS = 2;
+const PCM_CHUNK_MS = 10;
+const PCM_FRAME_BYTES = ((PCM_SAMPLE_RATE * PCM_CHUNK_MS) / 1000) * PCM_CHANNELS * 2;
 // EBML Cluster id: everything before it is the WebM header a late client needs.
 const CLUSTER_ID = Buffer.from([0x1f, 0x43, 0xb6, 0x75]);
 const SHARED_KEY = 'shared';
@@ -29,6 +35,7 @@ export class AudioService {
     this.sinks = new Map(); // capture key -> { name, moduleId }
     this.sinkFailure = null; // { message, at }
     this.ffmpegChecked = null;
+    this.parecChecked = null;
   }
 
   get enabled() {
@@ -55,12 +62,26 @@ export class AudioService {
     return this.streams.size;
   }
 
+  /** `pcm` streams raw samples and lets the browser decode them; `webm` encodes Opus. */
+  get captureMode() {
+    return this.config.audioCapture === 'webm' ? 'webm' : 'pcm';
+  }
+
   ffmpegAvailable() {
     if (this.ffmpegChecked) return this.ffmpegChecked;
     this.ffmpegChecked = new Promise((resolve) => {
       execFile(this.config.audioFfmpegPath, ['-version'], { timeout: 5000 }, (error) => resolve(!error));
     });
     return this.ffmpegChecked;
+  }
+
+  /** parec ships with pulseaudio-utils and writes raw PCM with no encoder. */
+  parecAvailable() {
+    if (this.parecChecked) return this.parecChecked;
+    this.parecChecked = new Promise((resolve) => {
+      execFile(this.config.audioParecPath, ['--version'], { timeout: 5000 }, (error) => resolve(!error));
+    });
+    return this.parecChecked;
   }
 
   /* ---------------------------------------------------------------- sinks */
@@ -225,11 +246,14 @@ class AudioStream {
     this.startedAt = 0;
     this.header = null;
     this.headerBuf = null;
+    this.transport = 'webm';
+    this.toneTimer = null;
   }
 
   info() {
     const backend = this.backend || this.resolveBackend();
     const enabled = this.hub.enabled;
+    const transport = backend?.mode === 'pcm' ? 'pcm' : 'webm';
     return {
       enabled,
       status: enabled ? this.status : 'disabled',
@@ -238,6 +262,11 @@ class AudioStream {
       reason: enabled
         ? this.reason || ''
         : 'Audio is disabled on this server (AUDIO_ENABLED=0 or AUDIO_SOURCE=off).',
+      transport,
+      format:
+        transport === 'pcm'
+          ? { encoding: 'pcm_s16le', sampleRate: PCM_SAMPLE_RATE, channels: PCM_CHANNELS }
+          : { encoding: 'opus', container: 'webm', bitrateKbps: this.config.audioBitrateKbps },
       bitrateKbps: this.config.audioBitrateKbps,
       listeners: this.sockets.size,
       platform: process.platform,
@@ -259,6 +288,7 @@ class AudioStream {
     if (kind === 'tone') {
       return {
         id: 'tone',
+        mode: this.hub.captureMode,
         label: 'Generated test tone (440 Hz)',
         input: ['-re', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000'],
       };
@@ -268,11 +298,24 @@ class AudioStream {
         this.reason = 'AUDIO_DEVICE must name a Windows audio capture device (Stereo Mix, VB-Cable Output, …).';
         return null;
       }
-      return { id: 'dshow', label: `DirectShow · ${device}`, input: ['-f', 'dshow', '-i', `audio=${device}`] };
+      // DirectShow only exists as an ffmpeg input; it stays on Opus/WebM.
+      return {
+        id: 'dshow',
+        mode: 'webm',
+        label: `DirectShow · ${device}`,
+        input: ['-f', 'dshow', '-i', `audio=${device}`],
+      };
     }
     const sink = this.hub.sinkFor(this.key);
     const target = sink ? `${sink}.monitor` : device || 'default';
-    return { id: 'pulse', label: `PulseAudio · ${target}`, input: ['-f', 'pulse', '-i', target] };
+    return {
+      id: 'pulse',
+      mode: this.hub.captureMode,
+      device: target,
+      label:
+        this.hub.captureMode === 'pcm' ? `PulseAudio · ${target} (raw PCM)` : `PulseAudio · ${target}`,
+      input: ['-f', 'pulse', '-i', target],
+    };
   }
 
   setStatus(status, reason = this.reason) {
@@ -353,20 +396,31 @@ class AudioStream {
   }
 
   async launch() {
-    if (!(await this.hub.ffmpegAvailable())) {
-      this.setStatus('unavailable', `ffmpeg was not found (${this.config.audioFfmpegPath}). Install ffmpeg to enable audio.`);
-      return;
-    }
-    // The sink must exist before Chromium is launched and before ffmpeg reads it.
+    // The sink must exist before Chromium is launched and before capture reads it.
     if (this.hub.perSession) await this.hub.prepareSink(this.key);
-    const backend = this.resolveBackend();
+    let backend = this.resolveBackend();
     if (!backend) {
       this.setStatus('unavailable', this.reason || 'No audio capture device is available on this server.');
       return;
     }
+    // parec only exists where PulseAudio does: fall back to ffmpeg rather than
+    // leaving a session silent on a minimal image.
+    if (backend.mode === 'pcm' && backend.id === 'pulse' && !(await this.hub.parecAvailable())) {
+      log.warn(`${this.config.audioParecPath} was not found; capturing Opus/WebM with ffmpeg instead`);
+      backend = { ...backend, mode: 'webm', label: `PulseAudio · ${backend.device}` };
+    }
+    if (backend.mode === 'webm' && !(await this.hub.ffmpegAvailable())) {
+      this.setStatus('unavailable', `ffmpeg was not found (${this.config.audioFfmpegPath}). Install ffmpeg to enable audio.`);
+      return;
+    }
     this.backend = backend;
+    this.transport = backend.mode;
     if (this.hub.perSession && backend.id === 'pulse' && !this.hub.sinkFor(this.key)) {
       log.warn('Audio for this session is sharing the default sink because its own sink is unavailable');
+    }
+    if (backend.mode === 'pcm') {
+      await this.launchPcm(backend);
+      return;
     }
 
     const args = [
@@ -457,6 +511,137 @@ class AudioStream {
     });
   }
 
+  /**
+   * Raw 16-bit stereo PCM straight to the browser, which decodes it with Web
+   * Audio. No encoder runs on the server: parec just copies the sink's samples.
+   */
+  async launchPcm(backend) {
+    this.status = 'starting';
+    this.transport = 'pcm';
+    this.bytes = 0;
+    this.broadcastStatus();
+
+    if (backend.id === 'tone') {
+      // Generating the test tone in-process keeps the transport testable on
+      // hosts without ffmpeg or a sound card.
+      const frames = PCM_FRAME_BYTES / (PCM_CHANNELS * 2);
+      const chunk = Buffer.allocUnsafe(PCM_FRAME_BYTES);
+      const step = (Math.PI * 2 * 440) / PCM_SAMPLE_RATE;
+      let phase = 0;
+      this.startedAt = Date.now();
+      this.status = 'live';
+      this.broadcastStatus();
+      log.info('Audio capture live (generated 440 Hz tone, raw 48 kHz PCM)');
+      this.toneTimer = setInterval(() => {
+        for (let frame = 0; frame < frames; frame += 1) {
+          const sample = Math.round(Math.sin(phase) * 0.2 * 32767);
+          phase += step;
+          if (phase > Math.PI * 2) phase -= Math.PI * 2;
+          chunk.writeInt16LE(sample, frame * 4);
+          chunk.writeInt16LE(sample, frame * 4 + 2);
+        }
+        this.emitPcm(chunk);
+      }, PCM_CHUNK_MS);
+      this.toneTimer.unref?.();
+      return;
+    }
+
+    if (!backend.device) {
+      this.setStatus('unavailable', 'No PulseAudio monitor source is available for this session.');
+      return;
+    }
+
+    let proc;
+    try {
+      proc = spawn(
+        this.config.audioParecPath,
+        [
+          '--format=s16le',
+          `--rate=${PCM_SAMPLE_RATE}`,
+          `--channels=${PCM_CHANNELS}`,
+          `--device=${backend.device}`,
+          '--raw',
+          '--latency-msec=10',
+          '--client-name=velocity-proxy',
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+    } catch (error) {
+      this.setStatus('unavailable', `Could not start parec: ${error.message}`);
+      return;
+    }
+    this.proc = proc;
+    let carry = null;
+
+    proc.stdout.on('data', (chunk) => {
+      if (!chunk?.length) return;
+      let payload = chunk;
+      if (carry) {
+        payload = Buffer.concat([carry, chunk]);
+        carry = null;
+      }
+      // Keep every frame 16-bit stereo aligned across pipe boundaries.
+      const usable = payload.length - (payload.length % 4);
+      if (usable !== payload.length) {
+        carry = payload.subarray(usable);
+        payload = payload.subarray(0, usable);
+      }
+      if (!payload.length) return;
+      if (this.status === 'starting') {
+        this.startedAt = Date.now();
+        this.setStatus('live');
+        log.info(`Audio capture live (${backend.label}, raw 48 kHz stereo PCM)`);
+      }
+      this.emitPcm(payload);
+    });
+
+    proc.stderr.on('data', (chunk) => {
+      this.stderr = `${this.stderr}${chunk.toString()}`.slice(-2000);
+    });
+
+    proc.on('error', (error) => {
+      this.proc = null;
+      this.setStatus('unavailable', `parec could not start: ${error.message}`);
+    });
+
+    proc.on('exit', (code) => {
+      const expected = this.status === 'stopping';
+      this.proc = null;
+      this.bytes = 0;
+      if (expected) {
+        this.status = 'idle';
+        return;
+      }
+      const detail = this.stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 300);
+      const reason = detail
+        ? `Audio capture stopped: ${detail}`
+        : `Audio capture stopped (parec exit ${code}).`;
+      if (this.sockets.size) {
+        this.setStatus('unavailable', reason);
+        log.warn(reason);
+      } else {
+        this.status = 'idle';
+      }
+    });
+  }
+
+  /** Forwards a PCM chunk, dropping it rather than queueing for a slow socket. */
+  emitPcm(chunk) {
+    // Digital silence is the common case between sounds and would otherwise
+    // cost ~1.5 Mbps per listener; a starved browser simply outputs silence.
+    if (!chunk.some((byte) => byte !== 0)) return;
+    this.bytes += chunk.length;
+    for (const ws of this.sockets) {
+      if (ws.readyState !== 1) continue;
+      if (ws.bufferedAmount > MAX_PCM_BUFFERED) continue;
+      try {
+        ws.send(chunk, { binary: true });
+      } catch {
+        /* closing */
+      }
+    }
+  }
+
   /** Keeps the WebM header so clients that connect mid-stream can decode. */
   captureHeader(chunk) {
     if (this.header) return;
@@ -498,8 +683,13 @@ class AudioStream {
   stop() {
     clearTimeout(this.stopTimer);
     this.stopTimer = null;
+    if (this.toneTimer) {
+      clearInterval(this.toneTimer);
+      this.toneTimer = null;
+    }
     if (!this.proc) {
       this.status = 'idle';
+      this.bytes = 0;
       return;
     }
     this.status = 'stopping';

@@ -25,6 +25,29 @@ let pendingBitmap = null;
 let paintScheduled = false;
 let paintedRect = null;
 
+// Live renderer counters for the performance panel. Cheap increments only.
+const stats = {
+  frames: 0,
+  painted: 0,
+  dropped: 0,
+  decodeMs: 0,
+  lastDecodeMs: 0,
+  fps: 0,
+  windowStart: 0,
+  windowPainted: 0,
+};
+
+export const viewportStats = () => ({
+  frames: stats.frames,
+  painted: stats.painted,
+  dropped: stats.dropped,
+  decodeMs: Math.round(stats.lastDecodeMs * 100) / 100,
+  fps: stats.fps,
+  width: dom.canvas ? dom.canvas.width : 0,
+  height: dom.canvas ? dom.canvas.height : 0,
+  zoom,
+});
+
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 export const initViewport = ({ send }) => {
@@ -373,10 +396,13 @@ const drawFrame = async (buffer) => {
 
   const jpeg = new Uint8Array(buffer, idOffset + idLength);
   const blob = new Blob([jpeg], { type: 'image/jpeg' });
+  stats.frames += 1;
+  const decodeStart = performance.now();
   let bitmap = null;
   if (typeof createImageBitmap === 'function') {
     bitmap = await createImageBitmap(blob).catch(() => null);
   }
+  stats.lastDecodeMs = performance.now() - decodeStart;
   if (!bitmap) return;
   if (tabId !== currentTabId) {
     bitmap.close();
@@ -395,7 +421,10 @@ const drawFrame = async (buffer) => {
  * a burst does not pile up GPU memory.
  */
 const schedulePaint = (bitmap) => {
-  if (pendingBitmap) pendingBitmap.close();
+  if (pendingBitmap) {
+    pendingBitmap.close();
+    stats.dropped += 1;
+  }
   pendingBitmap = bitmap;
   if (paintScheduled) return;
   paintScheduled = true;
@@ -429,6 +458,15 @@ const paintPending = () => {
   dom.ctx.drawImage(bitmap, x, y, width, height);
   bitmap.close();
   hasFrame = true;
+  stats.painted += 1;
+  stats.windowPainted += 1;
+  const now = performance.now();
+  if (!stats.windowStart) stats.windowStart = now;
+  if (now - stats.windowStart >= 1000) {
+    stats.fps = Math.round((stats.windowPainted * 1000) / (now - stats.windowStart));
+    stats.windowPainted = 0;
+    stats.windowStart = now;
+  }
   if (overlayMode === 'loading') hideOverlay();
 };
 

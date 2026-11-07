@@ -105,6 +105,11 @@ export const config = Object.freeze({
   audioSource: text(process.env.AUDIO_SOURCE, 'auto').toLowerCase(),
   audioDevice: text(process.env.AUDIO_DEVICE),
   audioFfmpegPath: text(process.env.AUDIO_FFMPEG_PATH, 'ffmpeg'),
+  // `pcm` streams raw 16-bit PCM from parec and lets the browser decode it with
+  // Web Audio, which removes the per-session Opus encode. `webm` keeps the
+  // ffmpeg Opus path (lower bandwidth, more server CPU).
+  audioCapture: text(process.env.AUDIO_CAPTURE, 'pcm').toLowerCase() === 'webm' ? 'webm' : 'pcm',
+  audioParecPath: text(process.env.AUDIO_PAREC_PATH, 'parec'),
   audioBitrateKbps: integer(process.env.AUDIO_BITRATE_KBPS, 64, 24, 160),
   audioPulseServer: text(process.env.AUDIO_PULSE_SERVER),
   audioPulseSink: text(process.env.AUDIO_PULSE_SINK),
@@ -126,9 +131,16 @@ export const config = Object.freeze({
   browserMode: text(process.env.BROWSER_MODE, 'headless').toLowerCase() === 'headed' ? 'headed' : 'headless',
   chromiumSandbox: text(process.env.CHROMIUM_SANDBOX, 'auto').toLowerCase(),
   chromiumArgs: text(process.env.CHROMIUM_ARGS).split(/\s+/).filter(Boolean),
+  // Collapses Chromium into one process. Off by default: it disables site
+  // isolation and the renderer sandbox, and is unsupported by Chromium.
+  chromiumSingleProcess: boolean(process.env.CHROMIUM_SINGLE_PROCESS, false),
   // Caps each renderer's V8 old space so one heavy page cannot grow without
   // bound. 0 leaves Chromium's default in place.
   chromiumJsHeapMb: integer(process.env.CHROMIUM_JS_HEAP_MB, 512, 0, 4096),
+  // Chromium's own audio output buffer, in frames. Smaller means the page's
+  // sound reaches the Pulse sink (and the viewer) sooner; Chromium clamps the
+  // value to 512–8192. 0 leaves the default.
+  chromiumAudioBuffer: integer(process.env.CHROMIUM_AUDIO_BUFFER, 1024, 0, 8192),
   userAgent: text(process.env.USER_AGENT),
 
   // CSP frame-ancestors. "*" allows embedding on any site; "'none'" (or "none")

@@ -1,10 +1,15 @@
+import { audioEngine } from './audio.js';
 import { api } from './net.js';
+import { orderedTabs, state } from './store.js';
 import { toast } from './ui.js';
+import { viewportStats } from './viewport.js';
 
 const dom = {};
-let timer = null;
+let statsTimer = null;
+let liveTimer = null;
 let loading = false;
 let initialized = false;
+let lastStats = null;
 
 const formatUptime = (seconds) => {
   const total = Math.max(0, Math.round(Number(seconds) || 0));
@@ -17,9 +22,9 @@ const formatUptime = (seconds) => {
 };
 
 const rows = (stats) => {
-  const resources = stats.resources || {};
-  const memory = stats.process || {};
-  const audio = stats.audio || {};
+  const resources = stats?.resources || {};
+  const memory = stats?.process || {};
+  const audio = stats?.audio || {};
   return [
     ['Server memory', `${memory.rssMb ?? 0} MB`],
     ['Heap in use', `${memory.heapMb ?? 0} MB`],
@@ -27,14 +32,15 @@ const rows = (stats) => {
     ['Live pages', `${resources.liveTabs ?? 0} / ${resources.maxLiveTabs ?? 1}`],
     ['Sessions', `${resources.sessions ?? 0}`],
     ['Audio streams', `${audio.streams ?? 0}`],
-    ['Uptime', formatUptime(stats.uptime)],
+    ['Uptime', formatUptime(stats?.uptime)],
   ];
 };
 
 const render = (stats) => {
+  lastStats = stats || lastStats;
   if (!dom.grid) return;
   dom.grid.innerHTML = '';
-  for (const [label, value] of rows(stats)) {
+  for (const [label, value] of rows(lastStats || {})) {
     const row = document.createElement('div');
     row.className = 'system-row';
     const term = document.createElement('dt');
@@ -45,11 +51,35 @@ const render = (stats) => {
     dom.grid.appendChild(row);
   }
   if (dom.note) {
-    const idle = stats.limits?.browserIdleSeconds;
+    const idle = lastStats?.limits?.browserIdleSeconds;
     dom.note.textContent = idle
       ? `Browsers with no connected visitor are released after ${idle}s. Releasing now keeps tabs, history and sign-in.`
       : 'Browsers with no connected visitor are released automatically.';
   }
+  renderLive();
+};
+
+const metric = (label, value) => `
+  <div class="perf-metric"><strong>${value}</strong><span>${label}</span></div>
+`;
+
+/** Viewer-side numbers, sampled once a second so they mean something. */
+const renderLive = () => {
+  if (!dom.strip) return;
+  const stats = viewportStats();
+  const audio = audioEngine.snapshot();
+  const tabs = orderedTabs().length;
+  const dropped = stats.frames ? `${stats.dropped}` : '0';
+  dom.strip.innerHTML = [
+    metric('FPS', stats.fps ? `${stats.fps}` : '—'),
+    metric('Frame decode', stats.painted ? `${stats.decodeMs.toFixed(1)} ms` : '—'),
+    metric('Dropped frames', dropped),
+    metric('Round trip', state.latency != null ? `${state.latency} ms` : '—'),
+    metric('Audio buffer', audio.available ? `${audio.latencyMs ?? 0} ms` : '—'),
+    metric('Audio path', audio.available ? (audio.transport === 'pcm' ? 'PCM' : 'Opus') : '—'),
+    metric('Canvas', stats.width ? `${stats.width}×${stats.height}` : '—'),
+    metric('Open tabs', `${tabs}`),
+  ].join('');
 };
 
 const refresh = async () => {
@@ -65,14 +95,19 @@ const refresh = async () => {
 };
 
 const startPolling = () => {
-  clearInterval(timer);
-  timer = setInterval(refresh, 3000);
-  if (timer.unref) timer.unref();
+  clearInterval(statsTimer);
+  clearInterval(liveTimer);
+  statsTimer = setInterval(refresh, 3000);
+  liveTimer = setInterval(renderLive, 1000);
+  if (statsTimer.unref) statsTimer.unref();
+  if (liveTimer.unref) liveTimer.unref();
 };
 
 const stopPolling = () => {
-  clearInterval(timer);
-  timer = null;
+  clearInterval(statsTimer);
+  clearInterval(liveTimer);
+  statsTimer = null;
+  liveTimer = null;
 };
 
 const reclaim = async () => {
@@ -98,6 +133,7 @@ export const initSystem = () => {
   initialized = true;
   dom.modal = document.getElementById('system-modal');
   dom.grid = document.getElementById('system-grid');
+  dom.strip = document.getElementById('perf-strip');
   dom.close = document.getElementById('system-close');
   dom.reclaim = document.getElementById('system-reclaim');
   dom.note = document.getElementById('system-note');
@@ -111,12 +147,14 @@ export const initSystem = () => {
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !dom.modal.hidden) closeSystem();
   });
+  document.addEventListener('velocity:open-perf', () => openSystem());
 };
 
 export const openSystem = () => {
   if (!initialized) initSystem();
   if (!dom.modal) return;
   dom.modal.hidden = false;
+  renderLive();
   refresh();
   startPolling();
 };

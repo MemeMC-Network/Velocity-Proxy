@@ -2,17 +2,28 @@ import { audioEngine } from './audio.js';
 import { api, connection } from './net.js';
 import {
   activeTab,
-  addShortcut,
+  assignTabToGroup,
+  createGroup,
   engineName,
   engineSearchTemplate,
-  findShortcut,
+  findBookmark,
+  GROUP_COLORS,
+  groupOfTab,
+  groupsList,
   normalizeUrl,
   orderedTabs,
+  pruneLayout,
+  removeGroup,
   removeShortcut,
+  saveLayout,
   saveSettings,
   saveShortcuts,
   setActiveId,
+  setTabOrder,
+  setTabTitle,
   state,
+  tabDisplayTitle,
+  toggleGroupCollapsed,
   upsertTab,
   removeTab,
 } from './store.js';
@@ -40,6 +51,15 @@ import { focusHomeSearch, initHome, refreshHome, updatePlaceholder } from './hom
 import { applyThemePreference, closeSettings, initSettings, openSettings, refreshSettings, setTheme } from './settings.js';
 import { closePalette, initPalette, openPalette } from './palette.js';
 import { initSystem, openSystem } from './system.js';
+import {
+  closeManagers,
+  initLibrary,
+  managersOpen,
+  openBookmarks,
+  openHistory,
+  refreshLibrary,
+  toggleBookmarkFor,
+} from './library.js';
 
 const els = {};
 const tabNodes = new Map();
@@ -49,6 +69,7 @@ let currentDialog = null;
 let omniEditing = false;
 let pingTimer = null;
 let boots = 0;
+let dragTabId = null;
 
 /* --------------------------------------------------------------------- boot */
 
@@ -69,6 +90,7 @@ const cacheElements = () => {
     'dialog-modal', 'dialog-title', 'dialog-message', 'dialog-input', 'dialog-cancel', 'dialog-ok',
     'find-bar', 'find-input', 'find-count', 'find-prev', 'find-next', 'find-close', 'find-btn', 'find-glyph',
     'shortcuts-modal', 'shortcuts-close',
+    'omni-clear', 'omni-send', 'omni-spinner', 'tab-search-btn', 'bookmarks-btn', 'history-btn',
   ];
   for (const id of ids) {
     els[id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = document.getElementById(id);
@@ -111,9 +133,11 @@ const applySession = (session) => {
   state.order = [];
   for (const tab of Array.isArray(session.tabs) ? session.tabs : []) upsertTab(tab);
   state.history = Array.isArray(session.history) ? session.history : [];
+  if (typeof session.historyEnabled === 'boolean') state.settings.historyEnabled = session.historyEnabled;
   if (Array.isArray(session.engines) && session.engines.length) state.engines = session.engines;
   if (session.limits) state.limits = { ...state.limits, ...session.limits };
   state.version = session.version || state.version;
+  pruneLayout(state.order);
 
   const initial =
     (typeof session.activeTabId === 'string' && state.tabs.has(session.activeTabId) && session.activeTabId) ||
@@ -135,14 +159,21 @@ const wireConnection = () => {
     if (Array.isArray(detail.history)) state.history = detail.history;
     if (detail.limits) state.limits = { ...state.limits, ...detail.limits };
     if (detail.version) state.version = detail.version;
+    if (typeof detail.historyEnabled === 'boolean') state.settings.historyEnabled = detail.historyEnabled;
+    pruneLayout(state.order);
     refreshSettings();
     refreshHome();
+    refreshLibrary();
 
-    const preferred =
-      (pendingActivation && state.tabs.has(pendingActivation) && pendingActivation) ||
-      (state.activeId && state.tabs.has(state.activeId) && state.activeId) ||
-      state.order[0] ||
-      null;
+    // "Open the home page" keeps the restored tabs in the strip but starts the
+    // view on the home surface instead of resuming the last page.
+    const startOnHome = state.settings.startup === 'home';
+    const preferred = startOnHome
+      ? null
+      : (pendingActivation && state.tabs.has(pendingActivation) && pendingActivation) ||
+        (state.activeId && state.tabs.has(state.activeId) && state.activeId) ||
+        state.order[0] ||
+        null;
 
     if (preferred) {
       setActiveId(preferred);
@@ -189,10 +220,12 @@ const wireConnection = () => {
     const index = before.findIndex((tab) => tab.id === id);
     const wasActive = state.activeId === id;
     removeTab(id);
+    pruneLayout(state.order);
     const node = tabNodes.get(id);
     node?.remove();
     tabNodes.delete(id);
     renderTabs();
+    refreshLibrary();
     if (els.app.classList.contains('is-newtab')) refreshHome();
     if (wasActive) {
       const remaining = orderedTabs();
@@ -211,6 +244,8 @@ const wireConnection = () => {
 
   connection.addEventListener('history', (event) => {
     state.history = event.detail.items || [];
+    if (typeof event.detail.enabled === 'boolean') state.settings.historyEnabled = event.detail.enabled;
+    refreshLibrary();
     if (!activeTab()?.url) refreshHome();
   });
 
@@ -271,6 +306,7 @@ const syncTabsFromServer = (tabs) => {
   }
   state.order = [];
   for (const tab of list) upsertTab(tab);
+  pruneLayout(state.order);
 };
 
 const updateConnectionStatus = (status) => {
@@ -303,19 +339,62 @@ const renderTabs = () => {
   const tabs = orderedTabs();
   const ids = new Set(tabs.map((tab) => tab.id));
   for (const [id, node] of tabNodes) {
+    if (id.startsWith('group:')) continue;
     if (!ids.has(id)) {
       node.remove();
       tabNodes.delete(id);
     }
   }
-  let previous = null;
-  for (const tab of tabs) {
-    let node = tabNodes.get(tab.id);
-    if (!node) {
-      node = createTabNode(tab);
-      tabNodes.set(tab.id, node);
+
+  const sequence = [];
+  const grouped = new Set();
+  for (const tab of tabs.filter((item) => item.pinned)) sequence.push({ tab });
+  if (state.settings.tabGroups !== false) {
+    for (const group of groupsList()) {
+      const members = tabs.filter((tab) => !tab.pinned && (group.tabs || []).includes(tab.id));
+      if (!members.length) continue;
+      sequence.push({ group, members });
+      members.forEach((tab) => grouped.add(tab.id));
     }
-    updateTabNode(node, tab);
+  }
+  for (const tab of tabs.filter((item) => !item.pinned && !grouped.has(item.id))) sequence.push({ tab });
+
+  const nodes = [];
+  const liveGroups = new Set();
+  for (const entry of sequence) {
+    if (entry.group) {
+      const key = `group:${entry.group.id}`;
+      let chip = tabNodes.get(key);
+      if (!chip) {
+        chip = createGroupNode(entry.group);
+        tabNodes.set(key, chip);
+      }
+      updateGroupNode(chip, entry.group, entry.members.length);
+      nodes.push(chip);
+      liveGroups.add(key);
+      if (entry.group.collapsed) continue;
+      for (const tab of entry.members) nodes.push(tabNodeFor(tab));
+    } else {
+      nodes.push(tabNodeFor(entry.tab));
+    }
+  }
+
+  const keepNodes = new Set(nodes);
+  for (const [id, node] of tabNodes) {
+    if (keepNodes.has(node)) continue;
+    if (id.startsWith('group:')) {
+      if (liveGroups.has(id)) continue;
+      node.remove();
+      tabNodes.delete(id);
+      continue;
+    }
+    // A tab inside a collapsed group stays in state but leaves the strip.
+    node.remove();
+    tabNodes.delete(id);
+  }
+
+  let previous = null;
+  for (const node of nodes) {
     if (previous) {
       if (previous.nextElementSibling !== node) els.tabs.insertBefore(node, previous.nextElementSibling);
     } else if (els.tabs.firstElementChild !== node) {
@@ -323,6 +402,16 @@ const renderTabs = () => {
     }
     previous = node;
   }
+};
+
+const tabNodeFor = (tab) => {
+  let node = tabNodes.get(tab.id);
+  if (!node) {
+    node = createTabNode(tab);
+    tabNodes.set(tab.id, node);
+  }
+  updateTabNode(node, tab);
+  return node;
 };
 
 const createTabNode = (tab) => {
@@ -337,6 +426,34 @@ const createTabNode = (tab) => {
     <button class="tab-audio" type="button" tabindex="-1" aria-label="Tab audio" title="Mute this tab" hidden>${icon('volume', 13)}</button>
     <button class="tab-close" type="button" tabindex="-1" aria-label="Close tab">${icon('close', 13)}</button>
   `;
+  node.draggable = true;
+  node.addEventListener('dragstart', (event) => {
+    dragTabId = tab.id;
+    node.classList.add('is-dragging');
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', tab.id);
+  });
+  node.addEventListener('dragend', () => {
+    dragTabId = null;
+    node.classList.remove('is-dragging');
+    renderTabs();
+  });
+  node.addEventListener('dragover', (event) => {
+    if (!dragTabId || dragTabId === tab.id) return;
+    event.preventDefault();
+    const rect = node.getBoundingClientRect();
+    const after = event.clientX > rect.left + rect.width / 2;
+    node.classList.toggle('is-drop-after', after);
+    node.classList.toggle('is-drop-before', !after);
+  });
+  node.addEventListener('dragleave', () => node.classList.remove('is-drop-before', 'is-drop-after'));
+  node.addEventListener('drop', (event) => {
+    event.preventDefault();
+    const after = node.classList.contains('is-drop-after');
+    node.classList.remove('is-drop-before', 'is-drop-after');
+    moveTab(dragTabId, tab.id, after);
+    dragTabId = null;
+  });
   node.addEventListener('click', () => activateTab(tab.id));
   node.addEventListener('auxclick', (event) => {
     if (event.button === 1) {
@@ -366,9 +483,17 @@ const updateTabNode = (node, tab) => {
   node.classList.toggle('is-loading', Boolean(tab.loading));
   node.setAttribute('aria-selected', isActive ? 'true' : 'false');
   const titleNode = node.querySelector('.tab-title');
-  const label = tab.title || (tab.url ? prettyHost(tab.host) : 'New Tab');
+  const label = tabDisplayTitle(tab, tab.url ? prettyHost(tab.host) : 'New Tab');
   if (titleNode.textContent !== label) titleNode.textContent = label;
   node.title = tab.url ? `${label}\n${tab.url}` : label;
+  const group = groupOfTab(tab.id);
+  if (group) {
+    node.style.setProperty('--group-color', group.color);
+    node.dataset.group = group.name;
+  } else {
+    node.style.removeProperty('--group-color');
+    delete node.dataset.group;
+  }
 
   const spinner = node.querySelector('.tab-spinner');
   spinner.hidden = !tab.loading;
@@ -390,6 +515,131 @@ const updateTabNode = (node, tab) => {
     audioBtn.title = tab.muted ? 'Unmute this tab' : 'Mute this tab';
   }
   node.classList.toggle('is-audible', Boolean(tab.audible) && !tab.muted);
+};
+
+const createGroupNode = (group) => {
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.className = 'tab-group';
+  chip.innerHTML =
+    '<span class="tab-group-dot"></span><span class="tab-group-name"></span><span class="tab-group-count"></span>';
+  chip.addEventListener('click', () => {
+    toggleGroupCollapsed(group.id);
+    renderTabs();
+  });
+  chip.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    menu.open(event.clientX, event.clientY, [
+      {
+        label: group.collapsed ? 'Expand group' : 'Collapse group',
+        icon: 'chevronDown',
+        onSelect: () => {
+          toggleGroupCollapsed(group.id);
+          renderTabs();
+        },
+      },
+      {
+        label: 'Rename group…',
+        icon: 'edit',
+        onSelect: () => {
+          const value = promptText('Group name', group.name);
+          if (value === null) return;
+          group.name = value || group.name;
+          saveLayout();
+          renderTabs();
+        },
+      },
+      {
+        label: 'Change colour',
+        icon: 'spark',
+        onSelect: () => {
+          const index = GROUP_COLORS.indexOf(group.color);
+          group.color = GROUP_COLORS[(index + 1) % GROUP_COLORS.length];
+          saveLayout();
+          renderTabs();
+        },
+      },
+      { separator: true },
+      {
+        label: 'Ungroup tabs',
+        icon: 'close',
+        danger: true,
+        onSelect: () => {
+          removeGroup(group.id);
+          renderTabs();
+        },
+      },
+    ]);
+  });
+  return chip;
+};
+
+const updateGroupNode = (chip, group, count) => {
+  chip.style.setProperty('--group-color', group.color);
+  chip.style.setProperty('--group-line', `color-mix(in srgb, ${group.color} 42%, transparent)`);
+  const nameNode = chip.querySelector('.tab-group-name');
+  if (nameNode.textContent !== group.name) nameNode.textContent = group.name;
+  chip.querySelector('.tab-group-count').textContent = String(count);
+  chip.classList.toggle('is-collapsed', Boolean(group.collapsed));
+  chip.title = group.collapsed ? `Expand “${group.name}”` : `Collapse “${group.name}”`;
+};
+
+const promptText = (message, fallback = '') => {
+  try {
+    const value = window.prompt(message, fallback);
+    return value === null ? null : value.trim();
+  } catch {
+    return null;
+  }
+};
+
+const moveTab = (dragId, targetId, after) => {
+  if (!dragId || !targetId || dragId === targetId) return;
+  const tabs = orderedTabs().filter((tab) => !tab.pinned);
+  const ids = tabs.map((tab) => tab.id);
+  const from = ids.indexOf(dragId);
+  const to = ids.indexOf(targetId);
+  if (from === -1 || to === -1) return;
+  ids.splice(from, 1);
+  const insertAt = ids.indexOf(targetId) + (after ? 1 : 0);
+  ids.splice(insertAt, 0, dragId);
+  setTabOrder([...orderedTabs().filter((tab) => tab.pinned).map((tab) => tab.id), ...ids]);
+  renderTabs();
+};
+
+const moveTabRelative = (id, delta) => {
+  const tabs = orderedTabs().filter((tab) => !tab.pinned);
+  const index = tabs.findIndex((tab) => tab.id === id);
+  const target = tabs[index + delta];
+  if (index === -1 || !target) return;
+  moveTab(id, target.id, delta > 0);
+};
+
+const renameTab = (id) => {
+  const tab = state.tabs.get(id);
+  if (!tab) return;
+  const value = promptText('Tab name', tabDisplayTitle(tab, tab.title || ''));
+  if (value === null) return;
+  setTabTitle(id, value === (tab.title || '') ? '' : value);
+  renderTabs();
+};
+
+const addTabToNewGroup = (id) => {
+  const tab = state.tabs.get(id);
+  const name = promptText('Group name', tab ? prettyHost(tab.host) || 'Group' : 'Group');
+  if (!name) return;
+  const group = createGroup(name, GROUP_COLORS[groupsList().length % GROUP_COLORS.length]);
+  assignTabToGroup(id, group.id);
+  renderTabs();
+};
+
+const closeTabsToRight = (id) => {
+  const tabs = orderedTabs();
+  const index = tabs.findIndex((tab) => tab.id === id);
+  if (index === -1) return;
+  for (const tab of tabs.slice(index + 1)) {
+    if (!tab.pinned) closeTab(tab.id);
+  }
 };
 
 const activateTab = (id) => {
@@ -450,30 +700,69 @@ const reopenClosed = () => {
 const openTabMenu = (id, x, y) => {
   const tab = state.tabs.get(id);
   if (!tab) return;
-  menu.open(x, y, [
+  const group = groupOfTab(id);
+  const items = [
     { label: 'Reload', icon: 'reload', onSelect: () => { activateTab(id); setTimeout(() => sendTab({ t: 'reload' }), 60); } },
     { label: 'Duplicate', icon: 'copy', onSelect: () => duplicateTab(id) },
     { label: tab.pinned ? 'Unpin tab' : 'Pin tab', icon: 'pin', onSelect: () => send({ t: 'tab:pin', tabId: id, pinned: !tab.pinned }) },
+    { label: 'Rename tab…', icon: 'edit', onSelect: () => renameTab(id) },
+    { label: 'Move left', icon: 'back', onSelect: () => moveTabRelative(id, -1) },
+    { label: 'Move right', icon: 'forward', onSelect: () => moveTabRelative(id, 1) },
     { label: 'Copy destination', icon: 'link', onSelect: () => copyText(tab.url || '') },
     { separator: true },
-    {
-      label: 'Close tab',
+    { label: 'Add to new group…', icon: 'grid', onSelect: () => addTabToNewGroup(id) },
+  ];
+  for (const candidate of groupsList()) {
+    if (candidate.id === group?.id) continue;
+    items.push({
+      label: `Move to “${candidate.name}”`,
+      icon: 'grid',
+      onSelect: () => {
+        assignTabToGroup(id, candidate.id);
+        renderTabs();
+      },
+    });
+  }
+  if (group) {
+    items.push({
+      label: `Remove from “${group.name}”`,
       icon: 'close',
-      danger: true,
-      onSelect: () => closeTab(id),
-    },
+      onSelect: () => {
+        assignTabToGroup(id, null);
+        renderTabs();
+      },
+    });
+  }
+  items.push(
+    { separator: true },
+    { label: 'Close tab', icon: 'close', danger: true, onSelect: () => closeTab(id) },
     {
       label: 'Close other tabs',
       icon: 'trash',
       danger: true,
       onSelect: () => {
-        for (const other of orderedTabs()) {
-          if (other.id !== id) closeTab(other.id);
-        }
+        for (const other of orderedTabs()) if (other.id !== id) closeTab(other.id);
       },
     },
-  ]);
+    { label: 'Close tabs to the right', icon: 'trash', danger: true, onSelect: () => closeTabsToRight(id) },
+  );
+  menu.open(x, y, items);
 };
+
+const newTabWithUrl = (url) => {
+  if (!connection.isOpen) {
+    toast('Still reconnecting to the proxy…', { tone: 'warn' });
+    connection.connect();
+    return;
+  }
+  if (state.tabs.size >= state.limits.maxTabs) {
+    toast(`Tab limit reached (${state.limits.maxTabs}).`, { tone: 'warn' });
+    return;
+  }
+  send({ t: 'tab:create', input: url, viewport: requestedSize() });
+};
+
+const openTabSearch = () => openPalette();
 
 /* ---------------------------------------------------------------- navigation */
 
@@ -593,7 +882,7 @@ const renderToolbar = () => {
     els.reload.setAttribute('aria-label', reloading ? 'Stop loading' : 'Reload');
   }
 
-  const bookmarked = Boolean(tab?.url && findShortcut(tab.url));
+  const bookmarked = Boolean(tab?.url && findBookmark(tab.url));
   if (els.bookmark.dataset.state !== (bookmarked ? 'on' : 'off')) {
     els.bookmark.dataset.state = bookmarked ? 'on' : 'off';
     els.bookmark.innerHTML = starIcon(bookmarked, 18);
@@ -632,6 +921,7 @@ const renderOmnibox = () => {
   }
   els.omniInput.placeholder = `Search ${state.settings.engine === 'custom' ? 'the web' : engineName()} or enter an address`;
   els.omniDisplay.title = tab?.url ? `Destination: ${tab.url}` : 'Type a URL or search';
+  if (els.omniSpinner) els.omniSpinner.hidden = !tab?.loading;
 };
 
 const renderLatency = () => {
@@ -652,6 +942,7 @@ const startOmniEdit = () => {
   omniEditing = true;
   els.omniboxForm.classList.add('is-editing');
   els.omniInput.value = activeTab()?.url || '';
+  if (els.omniClear) els.omniClear.hidden = !els.omniInput.value;
   requestAnimationFrame(() => {
     els.omniInput.focus();
     els.omniInput.select();
@@ -663,6 +954,7 @@ const endOmniEdit = () => {
   els.omniboxForm.classList.remove('is-editing');
   els.omniInput.blur();
   els.omniInput.value = '';
+  if (els.omniClear) els.omniClear.hidden = true;
   if (els.omniSuggest) {
     els.omniSuggest.hidden = true;
     els.omniSuggest.innerHTML = '';
@@ -684,6 +976,21 @@ const wireOmnibox = () => {
     if (!value) return;
     navigate(value);
     endOmniEdit();
+  });
+
+  els.omniInput.addEventListener('input', () => {
+    if (els.omniClear) els.omniClear.hidden = !els.omniInput.value;
+  });
+
+  els.omniClear?.addEventListener('click', () => {
+    els.omniInput.value = '';
+    els.omniClear.hidden = true;
+    els.omniInput.focus();
+  });
+
+  els.omniSend?.addEventListener('click', (event) => {
+    event.preventDefault();
+    els.omniboxForm.requestSubmit();
   });
 
   const suggester = createSuggester({
@@ -744,6 +1051,9 @@ const wireChrome = () => {
   els.activityBtn?.addEventListener('click', () => openSystem());
   els.fullscreenBtn?.addEventListener('click', () => toggleFullscreen());
   els.findBtn?.addEventListener('click', () => openFind());
+  els.bookmarksBtn?.addEventListener('click', () => openBookmarks());
+  els.historyBtn?.addEventListener('click', () => openHistory());
+  els.tabSearchBtn?.addEventListener('click', () => openTabSearch());
   els.findClose?.addEventListener('click', () => closeFind());
   els.findPrev?.addEventListener('click', () => stepFind(false));
   els.findNext?.addEventListener('click', () => stepFind(true));
@@ -779,6 +1089,9 @@ const wireChrome = () => {
   if (els.activityBtn) els.activityBtn.innerHTML = icon('activity', 18);
   if (els.fullscreenBtn) els.fullscreenBtn.innerHTML = icon('expand', 18);
   if (els.findBtn) els.findBtn.innerHTML = icon('search', 18);
+  if (els.bookmarksBtn) els.bookmarksBtn.innerHTML = icon('star', 17);
+  if (els.historyBtn) els.historyBtn.innerHTML = icon('clock', 17);
+  if (els.tabSearchBtn) els.tabSearchBtn.innerHTML = icon('search', 15);
   if (els.findGlyph) els.findGlyph.innerHTML = icon('search', 15);
   if (els.findPrev) els.findPrev.innerHTML = icon('chevronDown', 15);
   if (els.findNext) els.findNext.innerHTML = icon('chevronDown', 15);
@@ -788,17 +1101,7 @@ const wireChrome = () => {
 const toggleBookmark = () => {
   const tab = activeTab();
   if (!tab?.url) return;
-  const existingIndex = state.shortcuts.findIndex((item) => normalizeUrl(item.url) === normalizeUrl(tab.url));
-  if (existingIndex >= 0) {
-    const removed = state.shortcuts[existingIndex];
-    removeShortcut(existingIndex);
-    saveShortcuts();
-    toast(`Removed ${removed.title} from shortcuts`, { tone: 'info' });
-  } else {
-    addShortcut(tab.title || prettyHost(tab.host), tab.url);
-    saveShortcuts();
-    toast('Added to shortcuts', { tone: 'success' });
-  }
+  toggleBookmarkFor(tab);
   renderToolbar();
   refreshHome();
 };
@@ -955,6 +1258,29 @@ const wireGlobalKeys = () => {
         openPalette();
         return;
       }
+      if (mod && !event.shiftKey && key === 'h') {
+        event.preventDefault();
+        closeSettings();
+        openHistory();
+        return;
+      }
+      if (mod && event.shiftKey && key === 'b') {
+        event.preventDefault();
+        closeSettings();
+        openBookmarks();
+        return;
+      }
+      if (mod && event.shiftKey && key === 'a') {
+        event.preventDefault();
+        openTabSearch();
+        return;
+      }
+      if (mod && event.key === ',') {
+        event.preventDefault();
+        closeManagers();
+        openSettings();
+        return;
+      }
       if (mod && key === 'f') {
         event.preventDefault();
         openFind();
@@ -1023,6 +1349,10 @@ const wireGlobalKeys = () => {
           return;
         }
         if (closePalette()) return;
+        if (managersOpen()) {
+          closeManagers();
+          return;
+        }
         if (els.settingsPanel.classList.contains('is-open')) {
           closeSettings();
           return;
@@ -1261,6 +1591,7 @@ const wireAudio = () => {
   document.addEventListener(
     'pointerdown',
     () => {
+      if (state.settings.audioAutostart === false) return;
       audioEngine.enable().then(renderAudio).catch(() => {});
     },
     { once: true, capture: true },
@@ -1286,6 +1617,8 @@ const wireSettingsEvents = () => {
     refreshHome();
     renderToolbar();
   });
+  document.addEventListener('velocity:open-shortcuts', openShortcuts);
+  document.addEventListener('velocity:home', () => refreshHome());
 };
 
 const paletteActions = {
@@ -1349,6 +1682,7 @@ const start = async () => {
   setZoom(state.settings.zoom || 1);
   initHome({ onNavigate: navigate, onActivateTab: resumeTab });
   initPalette({ actions: paletteActions });
+  initLibrary({ navigate, openInNewTab: newTabWithUrl });
   initSystem();
   wireChrome();
   wireOmnibox();

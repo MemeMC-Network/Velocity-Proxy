@@ -11,10 +11,12 @@ import {
   updateShortcut,
 } from './store.js';
 import { createSuggester, faviconNode, menu, prettyHost, timeAgo, toast } from './ui.js';
+import { renderHomeBookmarks } from './library.js';
 
 let navigate = () => {};
 let activateTab = () => {};
 let shortcutEditingIndex = -1;
+let shortcutDragIndex = -1;
 let clockTimer = null;
 const dom = {};
 
@@ -113,6 +115,12 @@ export const initHome = ({ onNavigate, onActivateTab }) => {
     if (event.key === 'Escape' && dom.modal && !dom.modal.hidden) closeShortcutModal();
   });
 
+  document.addEventListener('velocity:home', refreshHome);
+  document.addEventListener('velocity:settings', (event) => {
+    if (event.detail?.key === 'tabGroups') return;
+    refreshHome();
+  });
+
   refreshHome();
   startClock();
 };
@@ -140,10 +148,34 @@ export const refreshHome = () => {
   if (!dom.shortcuts) return;
   dom.engineName.textContent = state.settings.engine === 'custom' ? 'Custom' : engineName();
   updatePlaceholder();
+  applyHomeVisibility();
+  renderBookmarksHome();
   renderContinue();
   renderShortcuts();
   renderRecent();
   renderFrequent();
+};
+
+const applyHomeVisibility = () => {
+  const settings = state.settings;
+  if (dom.greeting) dom.greeting.hidden = settings.homeGreeting === false;
+  if (dom.clock) dom.clock.hidden = settings.homeClock === false;
+  if (dom.date) dom.date.hidden = settings.homeClock === false;
+  document.getElementById('recent-section')?.toggleAttribute('hidden', settings.homeRecent === false);
+  document.getElementById('frequent-section')?.toggleAttribute('hidden', settings.homeFrequent === false);
+  document.getElementById('bookmarks-home-section')?.toggleAttribute('hidden', settings.homeBookmarks === false);
+  const columns = document.querySelector('.nt-columns');
+  if (columns) {
+    columns.hidden = settings.homeRecent === false && settings.homeFrequent === false;
+  }
+};
+
+const renderBookmarksHome = () => {
+  try {
+    renderHomeBookmarks();
+  } catch {
+    /* library may not be ready yet */
+  }
 };
 
 /* ------------------------------------------------------------------ continue */
@@ -297,6 +329,31 @@ const renderShortcuts = () => {
     label.className = 'tile-label';
     label.textContent = shortcut.title || host;
     tile.append(iconWrap, label);
+    tile.draggable = true;
+    tile.dataset.index = String(index);
+    tile.addEventListener('dragstart', (event) => {
+      shortcutDragIndex = index;
+      tile.classList.add('is-dragging');
+      event.dataTransfer.effectAllowed = 'move';
+    });
+    tile.addEventListener('dragend', () => {
+      shortcutDragIndex = -1;
+      tile.classList.remove('is-dragging');
+    });
+    tile.addEventListener('dragover', (event) => {
+      if (shortcutDragIndex < 0) return;
+      event.preventDefault();
+    });
+    tile.addEventListener('drop', (event) => {
+      event.preventDefault();
+      if (shortcutDragIndex < 0 || shortcutDragIndex === index) return;
+      const [moved] = state.shortcuts.splice(shortcutDragIndex, 1);
+      state.shortcuts.splice(index, 0, moved);
+      saveShortcuts();
+      shortcutDragIndex = -1;
+      renderShortcuts();
+      toast('Shortcut order saved', { tone: 'info', timeout: 1400 });
+    });
     tile.addEventListener('click', () => navigate(shortcut.url));
     tile.addEventListener('contextmenu', (event) => {
       event.preventDefault();
@@ -404,7 +461,7 @@ const startClock = () => {
     if (dom.date) {
       dom.date.textContent = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).format(now);
     }
-    if (dom.greeting) {
+    if (dom.greeting && state.settings.homeGreeting !== false) {
       const hour = now.getHours();
       dom.greeting.textContent =
         hour < 5 ? 'Good night.' : hour < 12 ? 'Good morning.' : hour < 18 ? 'Good afternoon.' : 'Good evening.';

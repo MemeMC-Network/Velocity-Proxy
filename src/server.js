@@ -144,6 +144,7 @@ app.get('/api/session', async (req, res, next) => {
       activeTabId: workspace.activeRecordId,
       audio: audio.info(req.workspaceKey),
       history: workspace.historySnapshot(),
+      historyEnabled: workspace.historyEnabled,
       limits: { maxTabs: config.maxTabs, frameQuality: config.frameQuality },
       engines: Object.entries(ENGINES).map(([id, engine]) => ({ id, name: engine.name, search: engine.search })),
     });
@@ -191,7 +192,7 @@ app.post('/api/reclaim', async (req, res, next) => {
 app.get('/api/history', async (req, res, next) => {
   try {
     const workspace = await manager.getWorkspace(req.workspaceKey);
-    res.json({ items: workspace.historySnapshot() });
+    res.json({ items: workspace.historySnapshot(), enabled: workspace.historyEnabled });
   } catch (error) {
     next(error);
   }
@@ -201,8 +202,24 @@ app.delete('/api/history', async (req, res, next) => {
   try {
     if (!AuthService.isSameOrigin(req)) return res.status(403).json({ error: 'Cross-origin request rejected' });
     const workspace = await manager.getWorkspace(req.workspaceKey);
+    const url = typeof req.query.url === 'string' ? req.query.url : '';
+    if (url) {
+      const removed = workspace.removeHistory(url);
+      return res.json({ ok: true, removed });
+    }
     workspace.clearHistory();
-    res.json({ ok: true });
+    return res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/history/settings', async (req, res, next) => {
+  try {
+    if (!AuthService.isSameOrigin(req)) return res.status(403).json({ error: 'Cross-origin request rejected' });
+    const workspace = await manager.getWorkspace(req.workspaceKey);
+    const enabled = workspace.setHistoryEnabled(req.body?.enabled !== false);
+    res.json({ ok: true, enabled });
   } catch (error) {
     next(error);
   }

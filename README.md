@@ -84,8 +84,15 @@ cancelled.
 
 **Audio**
 Each signed-in session gets its own Chromium process and its own PulseAudio null sink, captured by its
-own ffmpeg instance (DirectShow loopback on Windows), encoded to WebM/Opus and streamed over
-`/ws/audio`; the client plays it through Media Source Extensions. Audio is therefore per person: two
+own `parec` reader and streamed as raw 48 kHz stereo PCM over `/ws/audio`; the browser decodes and
+plays it with Web Audio (an AudioWorklet ring buffer), so no Opus encoder runs per listener. Set
+`AUDIO_CAPTURE=webm` to use ffmpeg's Opus/WebM capture and Media Source Extensions instead: that is
+~64 kbps per listener instead of ~1.5 Mbps, at the cost of encode CPU. DirectShow loopback on Windows
+always uses the ffmpeg/Opus path. Capture reads 10 ms chunks, and the browser is launched with a
+1024-frame output buffer (`CHROMIUM_AUDIO_BUFFER`) so its own mixing buffer does not put the page's
+sound behind the screencast. WebRTC is deliberately not used: it would add an Opus encoder, SRTP and
+ICE on the server, so it costs more CPU and memory than this path while offering the same codec
+bitrate as `AUDIO_CAPTURE=webm`. Audio is therefore per person: two
 visitors never hear each other's tabs. Audio starts on the first interaction (autoplay-safe) with a
 clear prompt if the browser blocks it. The toolbar has a global mute button, each tab has its own mute button and an
 indicator when it is producing sound, the settings drawer has a volume slider and audio status, and
@@ -96,8 +103,9 @@ last listener disconnects and when a tab closes.
 
 - Linux (Ubuntu 22.04+/Debian 12+) for production; Node.js 20+ anywhere for development.
 - ~1 GB RAM per few concurrent tabs; Chromium is CPU-hungry on video-heavy sites.
-- `ffmpeg` with libopus, plus PulseAudio or PipeWire on Linux for audio capture (the installer sets
-  both up). Windows development needs a loopback capture device in `AUDIO_DEVICE`.
+- PulseAudio or PipeWire on Linux for audio capture (`parec`, shipped by `pulseaudio-utils`; the
+  installer sets this up), plus `ffmpeg` with libopus for `AUDIO_CAPTURE=webm` and DirectShow capture.
+  Windows development needs a loopback capture device in `AUDIO_DEVICE`.
 - Node dependencies: `express`, `ws`, `playwright`, `compression`, `dotenv`.
 - For deployment: Docker (or the provided Render/Railway/Fly configs) — see [`DEPLOY.md`](DEPLOY.md).
 
@@ -217,12 +225,14 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `ALLOW_NO_AUTH` | `0` | Explicit opt-in for an unauthenticated proxy; refused on public interfaces. |
 | `MAX_TABS` / `MAX_SESSIONS` | `12` / `40` | Per user / global live Chromium contexts. |
 | `TAB_IDLE_MINUTES` | `10` | Idle tabs are suspended (state saved, context closed). |
-| `BROWSER_IDLE_SECONDS` | `180` | A session with no connected visitor loses its Chromium process, audio sink and ffmpeg after this long; tabs reload on reconnect. |
+| `BROWSER_IDLE_SECONDS` | `180` | A session with no connected visitor loses its Chromium process, audio sink and capture after this long; tabs reload on reconnect. |
 | `MAX_LIVE_BROWSERS` | `6` | Cap on concurrent Chromium processes. Only sessions with no connected visitor are evicted, least recently active first. |
 | `MAX_LIVE_TABS` | `16` | Cap on live pages across all sessions; the least recently used tab without viewers is suspended. |
 | `SCREENCAST_FPS` | `30` | Maximum frames pushed to viewers per second. Chromium skips the intermediate frames in the compositor, so they are never JPEG-encoded (at 30 fps this measured ~28% less browser CPU than encoding every frame), and the client drops anything still over the cap. |
 | `IDLE_POLL_MS` | `5000` | Page polling interval for tabs nobody is watching; `1100` while watched. |
 | `CHROMIUM_JS_HEAP_MB` | `512` | V8 old-space cap per renderer, so one heavy page cannot grow without bound. `0` keeps Chromium's default. |
+| `CHROMIUM_AUDIO_BUFFER` | `1024` | Frames in Chromium's own audio output buffer; lower means less audio delay relative to the video. Chromium clamps it to 512–8192. `0` keeps the default. |
+| `CHROMIUM_SINGLE_PROCESS` | `0` | Adds `--single-process`. Off by default: Chromium does not support single-process browsing, and it disables site isolation and the renderer sandbox. |
 | `NAV_TIMEOUT_MS` | `45000` | Navigation timeout. |
 | `FRAME_QUALITY` | `62` | Initial JPEG quality (1–90), adapts to back-pressure. |
 | `VIEWPORT_MAX_WIDTH/HEIGHT` | `1920` / `1200` | Caps for the remote viewport. |
@@ -233,7 +243,9 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `AUDIO_ENABLED` | `1` | Stream browser audio to the visitor. |
 | `AUDIO_SOURCE` | `auto` | `pulse`, `dshow`, `tone` or `off`; `auto` uses PulseAudio on Linux. |
 | `AUDIO_DEVICE` | – | `velocity_sink.monitor` on Linux, or a DirectShow loopback device on Windows. |
-| `AUDIO_FFMPEG_PATH` | `ffmpeg` | ffmpeg binary (needs libopus). |
+| `AUDIO_CAPTURE` | `pcm` | `pcm` streams raw 48 kHz stereo samples from `parec` and lets the browser decode them (no server-side encode; ~1.5 Mbps per listener while audio plays). `webm` uses ffmpeg's Opus encode (~64 kbps, more CPU). |
+| `AUDIO_PAREC_PATH` | `parec` | PulseAudio reader used for `AUDIO_CAPTURE=pcm`. Missing `parec` falls back to ffmpeg. |
+| `AUDIO_FFMPEG_PATH` | `ffmpeg` | ffmpeg binary (needs libopus) for `AUDIO_CAPTURE=webm`, DirectShow and the fallback. |
 | `AUDIO_BITRATE_KBPS` | `64` | Opus bitrate, 24–160. |
 | `AUDIO_PULSE_SERVER` / `AUDIO_PULSE_SINK` | – | PulseAudio server/sink for Chromium's output. |
 | `AUDIO_PER_SESSION` | `1` | One browser process, sink and capture per session (per-person audio). `0` shares one capture to save RAM. |
@@ -316,6 +328,41 @@ journalctl -u velocity-proxy -f
   instead of rendering the content, and it is never added to history. Built-in engines append
   safe-search flags (`safe=active`, `adlt=strict`, `kp=1`, `safesearch=strict`) and YouTube gets its
   restricted-mode cookie.
+
+## Interface
+
+The shell is a dark, quiet browser surface built from three materials: a charcoal
+background, one elevated surface per object, and hairlines. There are no gradients on
+controls, no glow, and no glass except where a panel deliberately floats over the page.
+Light theme mirrors the same geometry rather than inverting colours, and five accents
+(ember, sage, sky, violet, mono) recolour focus, selection and the primary action from a
+single custom property.
+
+- **Home**: greeting and clock (each can be hidden), search with an engine chip, saved
+  bookmarks, open-tab continuations, draggable shortcut tiles, recent activity grouped by
+day, and frequent sites. Backgrounds can be plain, a gradient, an image URL, or an image
+  uploaded from your machine (stored in `localStorage`, under 1.6 MB).
+- **Tabs**: drag to reorder, pin, duplicate, mute, rename, colour-coded groups that
+  collapse, close-others and close-to-the-right, reopen closed, and tab search through the
+  palette (`Ctrl+Shift+A`). Groups and ordering are viewer preferences and live in
+  `localStorage`; the tab contents themselves stay server-side.
+- **Omnibox**: URL vs search detection, history and shortcut suggestions, remote search
+  suggestions, keyboard navigation, a clear button, copy destination, secure-connection
+  and destination-favicon indicators, and a loading indicator that mirrors the tab.
+- **Bookmarks**: manager with folders, search, drag ordering, editing, JSON and
+  Netscape-HTML import, JSON export, a bookmark bar, and a home row. Unsaved bookmarks are
+  not synced between devices.
+- **History**: manager with search, period filter, day grouping, per-entry delete and
+  clear-all. Recording can be switched off per workspace; the flag is stored with the
+  workspace and stops new entries immediately.
+- **Settings**: Appearance, Browser, Search, Privacy, Performance, Audio, Shortcuts,
+  Workspaces and About, all persisted in `localStorage` (privacy flags also reach the
+  server). Saved tab sets capture the open URLs and can reopen them later.
+- **Performance panel**: FPS, frame-decode time, dropped frames, round trip, canvas size
+  and open tabs from the viewer, plus server memory, browsers, sessions and uptime.
+
+Not implemented: reading the page's own Web Notifications and re-raising them inside the
+shell. Chromium runs server-side, so there is no permission bridge for them yet.
 
 ## Browser build
 
@@ -446,6 +493,12 @@ Manual checks against the live UI (same build):
 | `tiktok.com/search?q=cats` | Renders the discover grid for “cats” with video cards and related tags |
 | Find in page | `Ctrl+F` reports `1/1` on example.com, steps with Enter, clears its highlight on Esc |
 | Browser build | `auto` launched installed Chrome 156.0.8078.81; X still 200, Snapchat sign-in page renders |
+| Bookmarks | Save from the manager, folder filter, bar and home row appear, survives reload |
+| History | Navigating records an entry; period filter, day grouping and delete work |
+| Tab groups | Context menu creates a coloured group; collapsing hides its tabs and expands again |
+| Home preferences | Accent, gradient background and the clock toggle survive a reload |
+| Settings | Category navigation switches sections; privacy toggle calls `POST /api/history/settings` |
+| Performance panel | Shows six viewer metrics plus server rows, sampled once a second |
 | Responsive layout | Desktop and 430 px layouts both behave (toolbar items collapse on narrow screens) |
 
 Not verifiable on the Windows development machine: the systemd unit, Nginx/TLS and Certbot
