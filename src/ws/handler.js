@@ -325,6 +325,15 @@ async function handle(client, workspace, message) {
           record.error = null;
           workspace.broadcast({ t: 'tab', tab: workspace.publicTab(record) });
           workspace.save();
+        } else if (message.t === 'reload' && record.url) {
+          // Reload is also the recovery path after the browser was suspended or
+          // killed: there is no page to reload, so open the URL again.
+          const viewport = readViewport(message.viewport);
+          record.status = 'loading';
+          record.error = null;
+          const next = await workspace.ensureLive(record, { viewport, restore: false });
+          next.attach(client);
+          await next.navigate(record.url);
         }
         return;
       }

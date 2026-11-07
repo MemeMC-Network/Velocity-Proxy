@@ -103,6 +103,12 @@ export class TabSession extends EventEmitter {
     this.frameSizeEma = 0;
     this.lastQualityChange = 0;
     this.lastFrameSentAt = 0;
+    // Frame watch: a screencast that silently stops (stuck compositor, failed
+    // software GL) leaves the viewer on a black canvas forever, so capture is
+    // restarted when nothing arrives for a while.
+    this.lastFrameAt = 0;
+    this.frameWatchdog = null;
+    this.frameRecoveries = 0;
     // What the encoder actually sustains. A page with constant damage can make
     // Chromium's JPEG encoding the bottleneck, and raising quality then costs
     // frames, which is exactly what reads as lag.
@@ -521,13 +527,44 @@ export class TabSession extends EventEmitter {
         maxHeight: Math.round(this.viewport.height),
         everyNthFrame: this.frameSkip,
       });
+      this.lastFrameAt = Date.now();
+      this.armFrameWatchdog();
     } catch (error) {
       this.streaming = false;
-      log.debug('startScreencast failed', this.id, error.message);
+      log.warn('startScreencast failed', this.id, String(error.message).split('\n')[0]);
     }
   }
 
+  /**
+   * Restarts a screencast that has gone quiet. Two attempts per tab: enough to
+   * recover from a stuck compositor, few enough that a genuinely broken page
+   * cannot turn into a restart loop.
+   */
+  armFrameWatchdog() {
+    clearTimeout(this.frameWatchdog);
+    if (this.closed) return;
+    this.frameWatchdog = setTimeout(() => {
+      this.frameWatchdog = null;
+      if (this.closed || !this.streaming) return;
+      if (Date.now() - this.lastFrameAt < 12_000) {
+        this.armFrameWatchdog();
+        return;
+      }
+      if (this.frameRecoveries >= 2) return;
+      this.frameRecoveries += 1;
+      log.warn(
+        `tab ${this.id} produced no screencast frames for 12s - restarting capture ` +
+          '(a GPU-less host renders in software; WebGL needs software GL enabled)',
+      );
+      this.frameSkip = 1;
+      this.restartStreaming().catch(() => {});
+    }, 12_000);
+    this.frameWatchdog.unref?.();
+  }
+
   async stopStreaming() {
+    clearTimeout(this.frameWatchdog);
+    this.frameWatchdog = null;
     if (!this.streaming || !this.cdp || this.closed) return;
     this.streaming = false;
     try {
@@ -561,6 +598,8 @@ export class TabSession extends EventEmitter {
   handleScreencastFrame(event) {
     if (!this.cdp || this.closed) return;
     this.cdp.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => {});
+    this.lastFrameAt = Date.now();
+    this.frameRecoveries = 0;
     const viewers = this.viewers();
     if (!viewers.length) return;
 
@@ -1088,6 +1127,8 @@ export class TabSession extends EventEmitter {
     clearTimeout(this.loadingTimer);
     clearTimeout(this.faviconTimer);
     clearTimeout(this.dialogTimer);
+    clearTimeout(this.frameWatchdog);
+    this.frameWatchdog = null;
     this.pollTimer = null;
   }
 

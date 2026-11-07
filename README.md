@@ -232,6 +232,7 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `IDLE_POLL_MS` | `5000` | Page polling interval for tabs nobody is watching; `1100` while watched. |
 | `CHROMIUM_JS_HEAP_MB` | `512` | V8 old-space cap per renderer, so one heavy page cannot grow without bound. `0` keeps Chromium's default. |
 | `CHROMIUM_AUDIO_BUFFER` | `1024` | Frames in Chromium's own audio output buffer; lower means less audio delay relative to the video. Chromium clamps it to 512–8192. `0` keeps the default. |
+| `CHROMIUM_SOFTWARE_GL` | `1` | Headless only: passes `--enable-unsafe-swiftshader` so a GPU-less host can still create WebGL contexts (Chrome 139+ blocks the software fallback otherwise). Does not affect the sandbox. |
 | `CHROMIUM_SINGLE_PROCESS` | `0` | Adds `--single-process`. Off by default: Chromium does not support single-process browsing, and it disables site isolation and the renderer sandbox. |
 | `NAV_TIMEOUT_MS` | `45000` | Navigation timeout. |
 | `FRAME_QUALITY` | `62` | Initial JPEG quality (1–90), adapts to back-pressure. |
@@ -310,7 +311,10 @@ journalctl -u velocity-proxy -f
   capture-to-paint lag in the performance panel; frames are dropped once a socket has ~350 kB queued
   rather than letting a slow link accumulate seconds of stale video. The client decodes with
   `createImageBitmap` and draws 1:1 to canvas; only the active tab streams, so switching tabs costs
-  no reload.
+  no reload. A host without a GPU is supported: Chromium renders in software, and headless launches
+  pass `--enable-unsafe-swiftshader` so WebGL pages are not blank. If capture goes quiet for 12 s the
+  screencast is restarted (twice at most) and the log says so; the viewer keeps a "rendering" message
+  instead of dropping to a black canvas.
 - **Input.** Pointer, wheel and key events are translated to CDP `Input.*` calls with the canvas
   scaling factored in. Text uses `Input.insertText`; special keys use a US-layout code map.
   Popups (`window.open`, `target=_blank`) are adopted as new proxy tabs — the real browser window

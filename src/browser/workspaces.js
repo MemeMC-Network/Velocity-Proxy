@@ -259,6 +259,10 @@ export class WorkspaceManager {
       ...(this.config.chromiumAudioBuffer > 0
         ? [`--audio-buffer-size=${this.config.chromiumAudioBuffer}`]
         : []),
+      // Most VPS hosts have no GPU, and Chrome 139+ refuses to create a WebGL
+      // context without hardware acceleration unless this opt-in is present, so
+      // WebGL pages render blank. Headless only; it changes no sandbox setting.
+      ...(headless && this.config.chromiumSoftwareGl ? ['--enable-unsafe-swiftshader'] : []),
       ...this.config.chromiumArgs,
     ];
     const base = {
@@ -966,15 +970,18 @@ class Workspace {
     session.on('visited', (visit) => this.addHistory(visit));
     session.on('dialog', (dialog) => this.broadcast({ t: 'dialog', dialog }));
     session.on('fullscreen', (on) => this.broadcast({ t: 'fullscreen', tabId: record.id, on }));
-    session.on('closed', (reason) => {
+    session.on('closed', () => {
+      // Every close the app performs (tab close, idle suspend, shutdown) clears
+      // record.session first, so reaching here means the page went away on its
+      // own: a browser crash, an OOM kill or a tab crash. Keep the record and its
+      // URL so the viewer can reload instead of silently losing the tab.
       if (record.session !== session) return;
       record.session = null;
       this.manager.pageOwners.delete(session.page);
-      if (reason === 'page-closed') {
-        this.removeRecord(record, { deleteStorage: false });
-      } else {
-        this.broadcast({ t: 'tab', tab: this.publicTab(record) });
-      }
+      record.status = 'error';
+      record.error = 'This tab closed unexpectedly. Reload to reopen this page.';
+      this.broadcast({ t: 'tab', tab: this.publicTab(record) });
+      this.save();
     });
   }
 
@@ -1093,11 +1100,18 @@ class Workspace {
     this.save();
   }
 
+  /**
+   * A crashed or killed Chromium leaves every tab without a page. Silently
+   * dropping to `idle` showed the viewer an empty canvas with no way back; the
+   * tab now reports an error that offers Reload, which reopens the URL.
+   */
   handleBrowserDisconnect() {
+    log.warn('session browser disconnected - tabs will reopen on demand (check free memory)');
     for (const record of this.records.values()) {
       if (!record.session) continue;
       record.session = null;
-      record.status = 'idle';
+      record.status = 'error';
+      record.error = 'The server browser closed unexpectedly. Reload to reopen this page.';
       this.broadcast({ t: 'tab', tab: this.publicTab(record) });
     }
   }

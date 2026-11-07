@@ -211,7 +211,10 @@ export const requestCopy = () => {
 
 export const showLoading = (title = 'Loading page…') => {
   if (hasFrame) return;
-  renderOverlay('loading', { title, text: 'Rendering on the server and streaming to you.' });
+  renderOverlay('loading', {
+    title,
+    text: 'Rendering on the server and streaming to you. A first visit can take a while on a slow host.',
+  });
 };
 
 export const showError = (message, { actionLabel = 'Try again', action = null } = {}) => {

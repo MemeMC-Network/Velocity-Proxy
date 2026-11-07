@@ -35,6 +35,7 @@ import {
   focusViewport,
   forwardKey,
   getZoom,
+  hasRenderedFrame,
   hideOverlay,
   initViewport,
   isEditableTarget,
@@ -857,6 +858,12 @@ const applyActiveView = () => {
     setActiveTab(tab);
     if (tab.status === 'error' && tab.error) {
       showError(tab.error, { actionLabel: 'Reload', action: reload });
+    } else if (!hasRenderedFrame()) {
+      // Nothing has been painted for this tab. The navigation watchdog clears
+      // `loading` after 30s, which used to hide this overlay and leave a black
+      // canvas with no explanation when the server browser was slow to produce
+      // its first frame. Keep telling the viewer it is still rendering.
+      showLoading(tab.title ? `Rendering ${tab.title}` : 'Rendering page…');
     } else if (!tab.loading) {
       hideOverlay();
     } else {

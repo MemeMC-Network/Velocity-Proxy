@@ -141,6 +141,10 @@ export const config = Object.freeze({
   // sound reaches the Pulse sink (and the viewer) sooner; Chromium clamps the
   // value to 512–8192. 0 leaves the default.
   chromiumAudioBuffer: integer(process.env.CHROMIUM_AUDIO_BUFFER, 1024, 0, 8192),
+  // Chrome 139+ no longer falls back to SwiftShader for WebGL on its own, which
+  // makes WebGL pages blank on a GPU-less server. This opts back in for headless
+  // launches; it does not touch the sandbox.
+  chromiumSoftwareGl: boolean(process.env.CHROMIUM_SOFTWARE_GL, true),
   userAgent: text(process.env.USER_AGENT),
 
   // CSP frame-ancestors. "*" allows embedding on any site; "'none'" (or "none")
