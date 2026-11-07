@@ -23,6 +23,11 @@ let frameSize = null;
 let contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
 let pendingBitmap = null;
 let pendingCaptureTs = null;
+// The last painted frame is kept alive so a canvas resize (window resize,
+// fullscreen, zoom, device-pixel-ratio change) can redraw it. Resizing clears
+// the canvas, and a static page emits no new frames - without this the viewer
+// went permanently black while audio kept playing.
+let lastBitmap = null;
 let paintScheduled = false;
 let paintedRect = null;
 // Server clock minus this clock, estimated from ping/pong round trips. The
@@ -170,6 +175,10 @@ export const setActiveTab = (tab) => {
       pendingBitmap.close();
       pendingBitmap = null;
     }
+    if (lastBitmap) {
+      lastBitmap.close();
+      lastBitmap = null;
+    }
     contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
     clearCanvas();
     hideOverlay();
@@ -186,6 +195,10 @@ export const clearViewport = () => {
   currentTabId = null;
   hasFrame = false;
   frameSize = null;
+  if (lastBitmap) {
+    lastBitmap.close();
+    lastBitmap = null;
+  }
   clearCanvas();
   hideOverlay();
   document.body.classList.remove('is-remote-fullscreen');
@@ -336,6 +349,11 @@ const applySize = () => {
     dom.canvas.height = bufferHeight;
     clearCanvas();
     if (frameSize) fitContent();
+    // Setting width/height wipes the bitmap. Redraw what was last shown and ask
+    // the server for a fresh capture at the new size, so the view never goes
+    // black just because the window changed.
+    repaintLastFrame();
+    if (currentTabId) sendMessage({ t: 'stream:refresh', tabId: currentTabId });
   }
   // Zoom narrows the remote CSS viewport so the page reflows for real instead of
   // being scaled blurrily on this side.
@@ -389,6 +407,17 @@ const fitContent = () => {
     height: Math.round(drawHeight),
     scale,
   };
+};
+
+/** Redraws the most recent frame after the canvas was resized or cleared. */
+const repaintLastFrame = () => {
+  if (!lastBitmap || !dom.ctx || !currentTabId) return;
+  fitContent();
+  const { x, y, width, height } = contentRect;
+  dom.ctx.fillStyle = '#07070a';
+  dom.ctx.fillRect(0, 0, dom.canvas.width, dom.canvas.height);
+  dom.ctx.drawImage(lastBitmap, x, y, width, height);
+  paintedRect = { x, y, width, height };
 };
 
 const pump = async () => {
@@ -492,7 +521,8 @@ const paintPending = () => {
     paintedRect = { x, y, width, height };
   }
   dom.ctx.drawImage(bitmap, x, y, width, height);
-  bitmap.close();
+  if (lastBitmap && lastBitmap !== bitmap) lastBitmap.close();
+  lastBitmap = bitmap;
   hasFrame = true;
   stats.painted += 1;
   stats.windowPainted += 1;

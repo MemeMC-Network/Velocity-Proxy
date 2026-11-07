@@ -360,6 +360,14 @@ async function handle(client, workspace, message) {
       return;
     }
 
+    case 'stream:refresh': {
+      // A resized viewer needs one fresh capture: a static page would otherwise
+      // never paint again after its canvas was cleared.
+      const { session } = await requireLive();
+      await session?.restartStreaming();
+      return;
+    }
+
     case 'stream': {
       if (!client.tabId) return;
       const record = workspace.getRecord(client.tabId);
