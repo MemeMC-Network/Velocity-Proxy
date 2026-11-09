@@ -553,29 +553,41 @@ export class TabSession extends EventEmitter {
   }
 
   /**
-   * Restarts a screencast that has gone quiet. Two attempts per tab: enough to
-   * recover from a stuck compositor, few enough that a genuinely broken page
-   * cannot turn into a restart loop.
+   * Restarts a screencast that has gone quiet.
+   *
+   * A tab that stalls twice is watched more slowly instead of being abandoned:
+   * giving up left the viewer on a black canvas until it reloaded the page, and
+   * on a small host a heavy page can stall more than twice and still recover.
+   * `frameRecoveries` returns to zero on the next frame, so a tab that paints
+   * again is watched at the normal cadence.
    */
   armFrameWatchdog() {
     clearTimeout(this.frameWatchdog);
     if (this.closed) return;
+    const stallMs = this.frameRecoveries >= 2 ? 30_000 : 12_000;
     this.frameWatchdog = setTimeout(() => {
       this.frameWatchdog = null;
       if (this.closed || !this.streaming) return;
-      if (Date.now() - this.lastFrameAt < 12_000) {
+      if (Date.now() - this.lastFrameAt < stallMs) {
         this.armFrameWatchdog();
         return;
       }
-      if (this.frameRecoveries >= 2) return;
       this.frameRecoveries += 1;
+      // A capture that keeps stalling is usually the encoder rather than the
+      // compositor, so ask for less of it: fewer frames and a smaller surface.
+      const rate = Math.max(10, Math.min(this.frameRate, 15));
+      const scale = Math.min(this.scale, 0.7);
+      const cheaper = rate !== this.frameRate || scale !== this.scale;
       log.warn(
-        `tab ${this.id} produced no screencast frames for 12s - restarting capture ` +
+        `tab ${this.id} produced no screencast frames for ${Math.round(stallMs / 1000)}s - ` +
+          `restarting capture${cheaper ? ` at ${rate} fps / ${Math.round(scale * 100)}%` : ''} ` +
           '(a GPU-less host renders in software; WebGL needs software GL enabled)',
       );
-      this.frameSkip = 1;
+      this.frameRate = rate;
+      this.frameSkip = Math.max(1, Math.round(60 / rate));
+      this.scale = scale;
       this.restartStreaming().catch(() => {});
-    }, 12_000);
+    }, stallMs);
     this.frameWatchdog.unref?.();
   }
 

@@ -348,8 +348,9 @@ journalctl -u velocity-proxy -f
   `createImageBitmap` and draws 1:1 to canvas; only the active tab streams, so switching tabs costs
   no reload. A host without a GPU is supported: Chromium renders in software, and headless launches
   pass `--enable-unsafe-swiftshader` so WebGL pages are not blank. If capture goes quiet for 12 s the
-  screencast is restarted (twice at most) and the log says so; the viewer keeps a "rendering" message
-  instead of dropping to a black canvas.
+  screencast is restarted at a lower frame rate and capture size, and the log says so; a tab that
+  keeps stalling is retried every 30 s rather than abandoned, because giving up left the viewer on a
+  black canvas until it reloaded.
 - **Input.** Pointer, wheel and key events are translated to CDP `Input.*` calls with the canvas
   scaling factored in. Text uses `Input.insertText`; special keys use a US-layout code map.
   Popups (`window.open`, `target=_blank`) are adopted as new proxy tabs — the real browser window
