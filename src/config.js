@@ -93,7 +93,8 @@ export const config = Object.freeze({
     1,
     64,
   ),
-  // Screencast frame rate and the poll cadence used while nobody is watching.
+  // Streaming: byte budget, frame rate and the poll cadence used while nobody
+  // is watching.
   screencastFps: integer(process.env.SCREENCAST_FPS, 30, 5, 60),
   idlePollMs: integer(process.env.IDLE_POLL_MS, 5000, 1000, 60000),
   navTimeoutMs: integer(process.env.NAV_TIMEOUT_MS, 45000, 5000, 180000),
@@ -103,6 +104,15 @@ export const config = Object.freeze({
   // rather than smooth video. Quality drops first, then capture resolution, to
   // stay under this.
   streamMaxKbps: integer(process.env.STREAM_MAX_KBPS, 12000, 1000, 50000),
+  // Lightweight engine: the page is fetched server-side, reduced to readable
+  // blocks and rendered by the viewer, so it costs no Chromium, no frame
+  // encoding and no per-tab browser memory.
+  lightEngine: boolean(process.env.LIGHT_ENGINE, true),
+  lightMaxBytes: integer(process.env.LIGHT_MAX_BYTES, 2_000_000, 50_000, 20_000_000),
+  lightTimeoutMs: integer(process.env.LIGHT_TIMEOUT_MS, 15_000, 2_000, 60_000),
+  lightCacheEntries: integer(process.env.LIGHT_CACHE_ENTRIES, 60, 0, 500),
+  lightCacheTtlMs: integer(process.env.LIGHT_CACHE_TTL_SECONDS, 300, 0, 3600) * 1000,
+
   viewportMaxWidth: integer(process.env.VIEWPORT_MAX_WIDTH, 1920, 640, 2560),
   viewportMaxHeight: integer(process.env.VIEWPORT_MAX_HEIGHT, 1200, 480, 1600),
 

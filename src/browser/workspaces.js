@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import { TabSession } from './tab.js';
+import { CookieJar } from '../light/cookies.js';
 import { FaviconCache } from './favicon.js';
 import { HttpError } from '../errors.js';
 import { log } from '../logger.js';
@@ -81,9 +82,10 @@ const TAB_ID_PATTERN = /^[a-f0-9]{8,40}$/;
 const HISTORY_LIMIT = 200;
 
 export class WorkspaceManager {
-  constructor(config, { audio = null } = {}) {
+  constructor(config, { audio = null, light = null } = {}) {
     this.config = config;
     this.audio = audio;
+    this.light = light;
     // Per-session audio needs a Chromium process per workspace, because Chromium
     // picks its audio device (PULSE_SINK) when the process starts.
     this.shared = { browser: null, launching: null };
@@ -118,7 +120,10 @@ export class WorkspaceManager {
     if (this.perSessionAudio) {
       log.info('Per-session audio: each signed-in visitor gets a Chromium process and audio sink');
     } else {
-      await this.ensureBrowser();
+      // Launched on the first browser-engine tab, not at boot: a server whose
+      // visitors only use the lightweight engine must never pay for Chromium,
+      // and an idle server should not hold a browser open either.
+      log.info('Chromium will launch with the first browser-engine tab');
     }
     this.cleanupTimer = setInterval(() => {
       this.cleanup().catch((error) => log.debug('cleanup failed', error.message));
@@ -557,8 +562,18 @@ export class WorkspaceManager {
     return count;
   }
 
-  async enforceLiveLimit(workspace) {
-    if (this.liveTabCount() < this.maxLiveTabs) return;
+  /** Pages served by the lightweight engine: these hold no Chromium at all. */
+  lightTabCount() {
+    let count = 0;
+    for (const workspace of this.workspaces.values()) {
+      for (const record of workspace.records.values()) {
+        if ((record.engine || 'chromium') === 'light' && record.url) count += 1;
+      }
+    }
+    return count;
+  }
+
+  async enforceLiveLimit(workspace) {    if (this.liveTabCount() < this.maxLiveTabs) return;
     const candidates = [];
     for (const other of this.workspaces.values()) {
       for (const record of other.records.values()) {
@@ -627,6 +642,7 @@ export class WorkspaceManager {
       maxLiveBrowsers: perSession ? Math.max(1, this.config.maxLiveBrowsers) : 1,
       liveTabs: this.liveTabCount(),
       maxLiveTabs: this.maxLiveTabs,
+      lightTabs: this.lightTabCount(),
       perSessionAudio: perSession,
     };
   }
@@ -685,6 +701,9 @@ class Workspace {
     this.saveTimer = null;
     this.historyTimer = null;
     this.loaded = false;
+    // Lightweight tabs share one cookie jar per visitor: no Chromium profile
+    // exists for them, and two visitors must never share one.
+    this.lightJar = new CookieJar();
   }
 
   /* ----------------------------------------------------------- persistence */
@@ -707,6 +726,12 @@ class Workspace {
           loading: false,
           error: null,
           session: null,
+          engine: tab.engine === 'light' ? 'light' : 'chromium',
+          lightState: null,
+          lightLoading: false,
+          lightError: null,
+          lightHistory: [],
+          lightIndex: -1,
           createdAt: Number(tab.createdAt) || Date.now(),
           lastUsedAt: Number(tab.lastUsedAt) || Date.now(),
         });
@@ -747,6 +772,7 @@ class Workspace {
         favicon: record.favicon,
         pinned: record.pinned,
         muted: Boolean(record.muted),
+        engine: record.engine || 'chromium',
         createdAt: record.createdAt,
         lastUsedAt: record.lastUsedAt,
       })),
@@ -826,8 +852,9 @@ class Workspace {
     if (!record) return null;
     if (record.session && record.session.isLive()) {
       const snapshot = record.session.snapshot();
-      return { ...snapshot, pinned: record.pinned, favicon: snapshot.favicon || record.favicon };
+      return { ...snapshot, pinned: record.pinned, favicon: snapshot.favicon || record.favicon, engine: 'chromium' };
     }
+    const engine = record.engine || 'chromium';
     return {
       id: record.id,
       url: record.url,
@@ -835,16 +862,31 @@ class Workspace {
       title: record.title || 'New Tab',
       favicon: record.favicon,
       pinned: record.pinned,
-      live: false,
-      loading: false,
-      canGoBack: false,
-      canGoForward: false,
+      live: engine === 'light' ? Boolean(record.lightState) : false,
+      loading: engine === 'light' ? Boolean(record.lightLoading) : false,
+      canGoBack: engine === 'light' ? record.lightIndex > 0 : false,
+      canGoForward: engine === 'light' ? record.lightIndex < (record.lightHistory?.length || 0) - 1 : false,
       secure: typeof record.url === 'string' && record.url.startsWith('https://'),
       muted: Boolean(record.muted),
       audible: false,
       status: record.status || 'idle',
       error: record.status === 'error' ? record.error : null,
       dialog: null,
+      engine,
+      light: this.lightSummary(record),
+    };
+  }
+
+  /** What the viewer needs to know about a light tab without the page body. */
+  lightSummary(record) {
+    if ((record.engine || 'chromium') !== 'light') return null;
+    return {
+      loading: Boolean(record.lightLoading),
+      error: record.lightError || null,
+      ready: Boolean(record.lightState),
+      requiresChromium: Boolean(record.lightState?.hints?.requiresChromium),
+      reason: record.lightState?.hints?.reason || null,
+      words: record.lightState?.words || 0,
     };
   }
 
@@ -852,7 +894,7 @@ class Workspace {
     return this.order.map((id) => this.publicTab(this.records.get(id))).filter(Boolean);
   }
 
-  async createTab({ url = null, title = null, pinned = false, id = null } = {}) {
+  async createTab({ url = null, title = null, pinned = false, id = null, engine = 'chromium' } = {}) {
     if (this.order.length >= this.config.maxTabs) {
       throw new HttpError(400, `Tab limit reached (${this.config.maxTabs}). Close a tab first.`);
     }
@@ -870,6 +912,12 @@ class Workspace {
       loading: false,
       error: null,
       session: null,
+      engine: engine === 'light' ? 'light' : 'chromium',
+      lightState: null,
+      lightLoading: false,
+      lightError: null,
+      lightHistory: [],
+      lightIndex: -1,
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
     };
@@ -997,6 +1045,20 @@ class Workspace {
     if (previous?.session) previous.session.detach(client);
 
     client.tabId = id;
+    if ((record.engine || 'chromium') === 'light') {
+      const tab = this.publicTab(record);
+      client.send({
+        t: 'tab:active',
+        id,
+        tab,
+        engine: 'light',
+        viewport: { width: viewport?.width || 1280, height: viewport?.height || 800 },
+      });
+      if (record.lightState) client.send({ t: 'light', tabId: id, page: record.lightState });
+      else if (record.lightError) this.sendLightState(record);
+      else if (record.url && !record.lightLoading) this.loadLight(record, record.url, { push: false }).catch(() => {});
+      return tab;
+    }
     if (!record.url && !record.session) {
       client.send({
         t: 'tab:active',
@@ -1019,6 +1081,124 @@ class Workspace {
       tab: this.publicTab(record),
       viewport: { width: session.viewport.width, height: session.viewport.height },
     });
+    return this.publicTab(record);
+  }
+
+  /* ----------------------------------------------------- lightweight engine */
+
+  sendLight(record, page, client = null) {
+    const message = { t: 'light', tabId: record.id, page };
+    if (client) client.send(message);
+    else this.broadcast(message);
+  }
+
+  sendLightState(record) {
+    this.broadcast({
+      t: 'light:state',
+      tabId: record.id,
+      ...this.lightSummary(record),
+    });
+  }
+
+  pushLightHistory(record, url) {
+    const stack = Array.isArray(record.lightHistory) ? record.lightHistory : [];
+    const kept = stack.slice(0, Math.max(0, record.lightIndex + 1));
+    if (kept[kept.length - 1] !== url) kept.push(url);
+    record.lightHistory = kept.slice(-100);
+    record.lightIndex = record.lightHistory.length - 1;
+  }
+
+  /**
+   * Fetches and renders a page without a browser. Failures stay in the tab as an
+   * error state, so a slow host never looks like a dead tab.
+   */
+  async loadLight(record, url, { push = true, force = false, client = null } = {}) {
+    const engine = this.manager?.light;
+    if (!engine) throw new HttpError(503, 'The lightweight engine is not available');
+    record.engine = 'light';
+    record.lightLoading = true;
+    record.lightError = null;
+    record.loading = true;
+    record.status = 'loading';
+    record.error = null;
+    this.broadcast({ t: 'tab', tab: this.publicTab(record) });
+    this.sendLightState(record);
+    try {
+      const page = await engine.load(url, { jar: this.lightJar, force });
+      record.lightState = page;
+      record.lightLoading = false;
+      record.loading = false;
+      record.status = 'idle';
+      record.url = page.url;
+      record.title = page.title || record.title;
+      const host = hostOf(page.url);
+      record.favicon = host ? `/api/favicon?host=${encodeURIComponent(host)}` : null;
+      record.lastUsedAt = Date.now();
+      if (push) this.pushLightHistory(record, page.url);
+      this.addHistory({ url: page.url, title: page.title });
+      this.broadcast({ t: 'tab', tab: this.publicTab(record) });
+      this.sendLight(record, page, client);
+      this.sendLightState(record);
+      this.save();
+      return page;
+    } catch (error) {
+      record.lightLoading = false;
+      record.loading = false;
+      record.status = 'error';
+      record.error = error?.message || 'This page could not be loaded';
+      record.lightError = record.error;
+      this.broadcast({ t: 'tab', tab: this.publicTab(record) });
+      this.sendLightState(record);
+      this.save();
+      return null;
+    }
+  }
+
+  async lightBack(record) {
+    const stack = record.lightHistory || [];
+    if (record.lightIndex <= 0) return null;
+    record.lightIndex -= 1;
+    return this.loadLight(record, stack[record.lightIndex], { push: false });
+  }
+
+  async lightForward(record) {
+    const stack = record.lightHistory || [];
+    if (record.lightIndex >= stack.length - 1) return null;
+    record.lightIndex += 1;
+    return this.loadLight(record, stack[record.lightIndex], { push: false });
+  }
+
+  /**
+   * Switches one tab between engines. The destination URL, the tab id and the
+   * tab's place in the strip are all preserved: only how the page is produced
+   * changes, so nothing about the visitor's session is lost.
+   */
+  async setEngine(record, engine, { viewport, client = null } = {}) {
+    const next = engine === 'light' ? 'light' : 'chromium';
+    if ((record.engine || 'chromium') === next) {
+      if (next === 'light' && record.lightState) this.sendLight(record, record.lightState, client);
+      return this.publicTab(record);
+    }
+    record.engine = next;
+    if (next === 'light') {
+      if (record.session) await this.suspend(record).catch(() => {});
+      record.lightError = null;
+      this.broadcast({ t: 'tab', tab: this.publicTab(record) });
+      if (record.url) await this.loadLight(record, record.url, { push: false, client });
+      else this.sendLightState(record);
+      this.save();
+      return this.publicTab(record);
+    }
+    record.lightState = null;
+    record.lightError = null;
+    record.lightLoading = false;
+    this.broadcast({ t: 'tab', tab: this.publicTab(record) });
+    if (record.url) {
+      const session = await this.ensureLive(record, { viewport, restore: false });
+      if (client) session.attach(client);
+      await session.navigate(record.url);
+    }
+    this.save();
     return this.publicTab(record);
   }
 

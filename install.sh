@@ -248,6 +248,7 @@ IDLE_POLL_MS=5000
 CHROMIUM_JS_HEAP_MB=512
 NAV_TIMEOUT_MS=45000
 FRAME_QUALITY=62
+STREAM_MAX_KBPS=12000
 VIEWPORT_MAX_WIDTH=1920
 VIEWPORT_MAX_HEIGHT=1200
 
@@ -255,6 +256,14 @@ BROWSER_MODE=headless
 CHROMIUM_SANDBOX=auto
 CHROMIUM_PATH=
 CHROMIUM_ARGS=
+
+# Lightweight engine: fetch + extract + client render, so a text page costs no
+# Chromium process and no frame streaming. Switch per tab in the toolbar.
+LIGHT_ENGINE=1
+LIGHT_MAX_BYTES=2000000
+LIGHT_TIMEOUT_MS=15000
+LIGHT_CACHE_ENTRIES=60
+LIGHT_CACHE_TTL_SECONDS=300
 
 # Chromium plays into a private PulseAudio null sink; ffmpeg records its monitor.
 AUDIO_ENABLED=1

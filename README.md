@@ -82,6 +82,24 @@ Per-tab `BrowserContext` (isolated cookies, localStorage, cache, permissions), C
 `Page.startScreencast` JPEG frames, adaptive quality, popups adopted as proxy tabs, downloads
 cancelled.
 
+**Two engines**
+Every tab runs in one of two engines, switched with the **Full / Light** chip in the toolbar; the tab
+keeps its id, URL and position.
+
+- **Full browser** (default): Chromium renders the page and streams JPEG frames. JavaScript, video,
+  logins, forms, canvas, find-in-page, zoom and audio all behave as before.
+- **Lightweight**: the page is fetched and extracted on the server and drawn by the viewer as
+  structured blocks — no Chromium, no frames, no per-tab browser memory. Measured at ~10 ms per
+  article and ~33 MB of server memory for ten tabs against ~232 MB per Chromium tab
+  ([report](docs/benchmarks.md)). Articles, docs, wikis and search results work; JavaScript apps are
+  detected and offered the full browser instead, never switched silently.
+
+The engine never hands third-party HTML to the page: the server sends a block model and the client
+builds DOM nodes with `createElement`/`textContent`. See [`docs/light-engine.md`](docs/light-engine.md)
+for the architecture, the compatibility matrix and why Ultraviolet was studied but not vendored
+(AGPL-3.0, deprecated, and it requires framing the destination — incompatible with `frame-src 'none'`
+and the URL lock).
+
 **Audio**
 Each signed-in session gets its own Chromium process and its own PulseAudio null sink, captured by its
 own `parec` reader and streamed as raw 48 kHz stereo PCM over `/ws/audio`; the browser decodes and
@@ -211,6 +229,17 @@ npm start                     # or: npm run dev (watch mode)
 
 Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 
+## Tests and benchmarks
+
+```bash
+npm run smoke        # 38 end-to-end checks: login, tabs, streaming, input, SSRF guards
+npm run test:light   # 12 checks for the lightweight engine: extraction, links, history, guards
+npm run bench        # real measurement of both engines on this machine
+```
+
+All three boot their own server on a throwaway data directory and clean up afterwards. The
+benchmark report and its methodology live in [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## Configuration (`.env`)
 
 | Variable | Default | Purpose |
@@ -236,7 +265,12 @@ Open `http://127.0.0.1:8080`, sign in with `ACCESS_PASSWORD`.
 | `CHROMIUM_SINGLE_PROCESS` | `0` | Adds `--single-process`. Off by default: Chromium does not support single-process browsing, and it disables site isolation and the renderer sandbox. |
 | `NAV_TIMEOUT_MS` | `45000` | Navigation timeout. |
 | `FRAME_QUALITY` | `62` | Initial JPEG quality (1–90), adapts to back-pressure. |
-| `STREAM_MAX_KBPS` | `12000` | Bandwidth cap for one tab's stream. Above it the capture resolution drops in steps to 70%, then JPEG quality. Thirty 100 KB frames a second is 24 Mbps, which saturates a small VPS uplink and arrives in bursts instead of smooth video. |
+| `STREAM_MAX_KBPS` | `12000` | Bandwidth budget for one tab's stream, averaged over a second. Above it JPEG quality falls to 40, then the frame rate to 20, then capture resolution to 70%. Thirty 100 KB frames a second is 24 Mbps, which saturates a small VPS uplink and arrives in bursts instead of smooth video. |
+| `LIGHT_ENGINE` | `1` | Enable the lightweight engine and its routes. See [`docs/light-engine.md`](docs/light-engine.md). |
+| `LIGHT_MAX_BYTES` | `2000000` | Largest page body the light engine will read (enforced while streaming, not from `Content-Length`). |
+| `LIGHT_TIMEOUT_MS` | `15000` | Per-request timeout for light fetches, including redirects. |
+| `LIGHT_CACHE_ENTRIES` | `60` | Extraction cache size, keyed by URL. |
+| `LIGHT_CACHE_TTL_SECONDS` | `300` | Cache lifetime; `0` disables it. |
 | `VIEWPORT_MAX_WIDTH/HEIGHT` | `1920` / `1200` | Caps for the remote viewport. |
 | `BROWSER_MODE` | `headless` | `headless` or `headed` (needs X/xvfb). |
 | `CHROMIUM_PATH` | – | Use a system Chromium instead of Playwright's build. |

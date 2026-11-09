@@ -1,4 +1,5 @@
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import compression from 'compression';
 import express from 'express';
@@ -7,6 +8,7 @@ import { AuthService } from './auth.js';
 import { WorkspaceManager } from './browser/workspaces.js';
 import { config } from './config.js';
 import { HttpError } from './errors.js';
+import { LightEngine } from './light/engine.js';
 import { log } from './logger.js';
 import { RateLimiter, clientIp } from './security/rate-limit.js';
 import { isBlockedHostname } from './security/ip-guard.js';
@@ -17,7 +19,8 @@ import { delay } from './util.js';
 const auth = new AuthService();
 const limiter = new RateLimiter();
 const audio = new AudioService(config);
-const manager = new WorkspaceManager(config, { audio });
+const light = new LightEngine(config);
+const manager = new WorkspaceManager(config, { audio, light });
 const app = express();
 
 app.disable('x-powered-by');
@@ -146,6 +149,7 @@ app.get('/api/session', async (req, res, next) => {
       history: workspace.historySnapshot(),
       historyEnabled: workspace.historyEnabled,
       limits: { maxTabs: config.maxTabs, frameQuality: config.frameQuality },
+      light: { enabled: config.lightEngine, maxBytes: config.lightMaxBytes },
       engines: Object.entries(ENGINES).map(([id, engine]) => ({ id, name: engine.name, search: engine.search })),
     });
   } catch (error) {
@@ -167,8 +171,14 @@ app.get('/api/stats', (req, res) => {
       rssMb: Math.round(usage.rss / 1048576),
       heapMb: Math.round(usage.heapUsed / 1048576),
       externalMb: Math.round(usage.external / 1048576),
+      // Cumulative microseconds. A benchmark differences two samples to get CPU
+      // time without the server having to keep a sampling timer of its own.
+      cpuUserMs: Math.round(process.cpuUsage().user / 1000),
+      cpuSystemMs: Math.round(process.cpuUsage().system / 1000),
+      cores: os.cpus().length,
     },
     resources: manager.stats(),
+    light: light.stats(),
     audio: { streams: audio.streamCount, status: audio.overallStatus() },
     limits: {
       maxTabs: config.maxTabs,
@@ -268,6 +278,41 @@ app.get('/api/favicon', async (req, res, next) => {
     res.send(icon.buffer);
   } catch (error) {
     next(error);
+  }
+});
+
+/* ------------------------------------------------------- lightweight engine */
+
+app.get('/api/light/page', async (req, res, next) => {
+  try {
+    if (!config.lightEngine) return res.status(503).json({ error: 'The lightweight engine is disabled' });
+    const raw = typeof req.query.u === 'string' ? req.query.u : '';
+    if (!raw) return res.status(400).json({ error: 'Missing url' });
+    const workspace = await manager.getWorkspace(req.workspaceKey);
+    workspace.touch();
+    const page = await light.load(raw, { jar: workspace.lightJar, force: req.query.force === '1' });
+    return res.json({ ok: true, page });
+  } catch (error) {
+    if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
+    return next(error);
+  }
+});
+
+app.get('/api/light/asset', async (req, res, next) => {
+  try {
+    if (!config.lightEngine) return res.status(503).json({ error: 'The lightweight engine is disabled' });
+    const raw = typeof req.query.u === 'string' ? req.query.u : '';
+    if (!raw) return res.status(400).json({ error: 'Missing url' });
+    const workspace = await manager.getWorkspace(req.workspaceKey);
+    const asset = await light.asset(raw, { jar: workspace.lightJar });
+    res.setHeader('Content-Type', asset.contentType);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Content-Security-Policy', "default-src 'none'");
+    return res.send(asset.body);
+  } catch (error) {
+    if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
+    return next(error);
   }
 });
 

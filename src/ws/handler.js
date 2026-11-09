@@ -254,7 +254,14 @@ async function handle(client, workspace, message) {
       if (typeof message.input === 'string' && message.input.trim()) {
         url = await resolveInput(message);
       }
-      const record = await workspace.createTab({ url, pinned: Boolean(message.pinned) });
+      const record = await workspace.createTab({
+        url,
+        pinned: Boolean(message.pinned),
+        engine: message.engine === 'light' ? 'light' : 'chromium',
+      });
+      if (record.engine === 'light' && record.url) {
+        await workspace.loadLight(record, record.url, { push: true });
+      }
       await workspace.activate(client, record.id, readViewport(message.viewport));
       return;
     }
@@ -273,7 +280,13 @@ async function handle(client, workspace, message) {
 
     case 'tab:duplicate': {
       const record = requireRecord();
-      const copy = await workspace.createTab({ url: record.url, title: record.title, pinned: false });
+      const copy = await workspace.createTab({
+        url: record.url,
+        title: record.title,
+        pinned: false,
+        engine: record.engine,
+      });
+      if (copy.engine === 'light' && copy.url) await workspace.loadLight(copy, copy.url, { push: true });
       await workspace.activate(client, copy.id, readViewport(message.viewport));
       return;
     }
@@ -294,6 +307,10 @@ async function handle(client, workspace, message) {
     case 'nav': {
       const record = requireRecord();
       const target = await resolveInput(message);
+      if ((record.engine || 'chromium') === 'light') {
+        await workspace.loadLight(record, target, { push: true, client });
+        return;
+      }
       record.url = target;
       record.status = 'loading';
       record.error = null;
@@ -317,6 +334,26 @@ async function handle(client, workspace, message) {
     case 'stop':
     case 'home': {
       const { record, session } = await requireLive();
+      if ((record.engine || 'chromium') === 'light') {
+        if (message.t === 'back') await workspace.lightBack(record);
+        else if (message.t === 'forward') await workspace.lightForward(record);
+        else if (message.t === 'reload' && record.url) {
+          await workspace.loadLight(record, record.url, { push: false, force: true });
+        } else if (message.t === 'home') {
+          record.url = null;
+          record.lightState = null;
+          record.lightError = null;
+          record.lightHistory = [];
+          record.lightIndex = -1;
+          record.title = 'New Tab';
+          record.status = 'idle';
+          record.error = null;
+          record.loading = false;
+          workspace.broadcast({ t: 'tab', tab: workspace.publicTab(record) });
+          workspace.save();
+        }
+        return;
+      }
       if (!session) {
         if (message.t === 'home') {
           record.url = null;
@@ -342,6 +379,17 @@ async function handle(client, workspace, message) {
       else if (message.t === 'reload') await session.reload();
       else if (message.t === 'stop') await session.stop();
       else await session.goHome();
+      return;
+    }
+
+    case 'engine:set': {
+      const record = requireRecord();
+      const engine = message.engine === 'light' ? 'light' : 'chromium';
+      const tab = await workspace.setEngine(record, engine, {
+        viewport: readViewport(message.viewport),
+        client,
+      });
+      client.send({ t: 'engine', tabId: record.id, engine, tab });
       return;
     }
 

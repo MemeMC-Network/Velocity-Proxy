@@ -12,12 +12,15 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "smoke": "node scripts/smoke-test.mjs",
+    "test:light": "node scripts/light-test.mjs",
+    "bench": "node scripts/benchmark.mjs",
     "browser:install": "playwright install chromium"
   },
   "dependencies": {
     "compression": "^1.7.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "parse5": "^7.3.0",
     "playwright": "^1.49.1",
     "ws": "^8.18.0"
   }

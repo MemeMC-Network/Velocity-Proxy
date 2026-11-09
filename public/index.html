@@ -17,6 +17,7 @@
     <link rel="stylesheet" href="/css/app.css" />
     <link rel="stylesheet" href="/css/theme.css" />
     <link rel="stylesheet" href="/css/audio.css" />
+    <link rel="stylesheet" href="/css/light.css" />
   </head>
   <body>
     <div class="app" id="app">
@@ -68,6 +69,7 @@
           </form>
 
           <div class="toolbar-actions">
+            <button class="engine-btn" id="engine-btn" type="button" data-engine="chromium" title="Browsing engine">Full</button>
             <button class="icon-btn" id="bookmarks-btn" type="button" aria-label="Bookmarks" title="Bookmarks (Ctrl+Shift+B)"></button>
             <button class="icon-btn" id="history-btn" type="button" aria-label="History" title="History (Ctrl+H)"></button>
             <button class="icon-btn" id="find-btn" type="button" aria-label="Find in page" title="Find in page (Ctrl+F)"></button>
@@ -185,6 +187,9 @@
 
         <div class="viewer" id="viewer">
           <canvas id="screen" class="screen" tabindex="-1" aria-label="Remote browser surface"></canvas>
+          <div class="light-view" id="light-view" hidden>
+            <div class="light-shell" id="light-shell" role="document" aria-live="polite"></div>
+          </div>
           <textarea
             id="ime"
             class="ime"

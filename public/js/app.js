@@ -49,6 +49,7 @@ import {
   toggleFullscreen,
 } from './viewport.js';
 import { focusHomeSearch, initHome, refreshHome, updatePlaceholder } from './home.js';
+import { hideLight, initLightView, showLight } from './light.js';
 import { applyThemePreference, closeSettings, initSettings, openSettings, refreshSettings, setTheme } from './settings.js';
 import { closePalette, initPalette, openPalette } from './palette.js';
 import { initSystem, openSystem } from './system.js';
@@ -65,6 +66,9 @@ import {
 const els = {};
 const tabNodes = new Map();
 const closedTabs = [];
+// Light-engine pages by tab id: the block model is the page, so switching tabs
+// does not refetch it.
+const lightPages = new Map();
 let pendingActivation = null;
 let currentDialog = null;
 let omniEditing = false;
@@ -92,10 +96,50 @@ const cacheElements = () => {
     'find-bar', 'find-input', 'find-count', 'find-prev', 'find-next', 'find-close', 'find-btn', 'find-glyph',
     'shortcuts-modal', 'shortcuts-close',
     'omni-clear', 'omni-send', 'omni-spinner', 'tab-search-btn', 'bookmarks-btn', 'history-btn',
+    'engine-btn', 'light-view', 'light-shell',
   ];
   for (const id of ids) {
     els[id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = document.getElementById(id);
   }
+
+  els.engineBtn?.addEventListener('click', () => {
+    const tab = activeTab();
+    if (!tab?.url) return;
+    switchEngine(tab.engine === 'light' ? 'chromium' : 'light', tab.id);
+  });
+
+  initLightView({
+    onNavigate: (url) => {
+      const tab = activeTab();
+      if (!tab || !url) return;
+      tab.pendingNavigation = true;
+      tab.loading = true;
+      upsertTab({ ...tab });
+      send({ t: 'nav', tabId: tab.id, input: url, viewport: requestedSize() });
+      applyActiveView();
+    },
+  });
+
+  window.addEventListener('velocity:engine-request', (event) => {
+    switchEngine(event.detail?.engine, event.detail?.tabId);
+  });
+  window.addEventListener('velocity:light-retry', () => {
+    const tab = activeTab();
+    if (tab?.url) send({ t: 'reload', tabId: tab.id, viewport: requestedSize() });
+  });
+};
+
+/** Switches one tab between the full browser and the lightweight engine. */
+const switchEngine = (engine, tabId = state.activeId) => {
+  const tab = tabId ? state.tabs.get(tabId) : null;
+  if (!tab?.url) return;
+  const next = engine === 'light' ? 'light' : 'chromium';
+  tab.engine = next;
+  tab.pendingNavigation = true;
+  tab.loading = true;
+  upsertTab({ ...tab });
+  send({ t: 'engine:set', tabId: tab.id, engine: next, viewport: requestedSize() });
+  applyActiveView();
 };
 
 const send = (message) => {
@@ -202,6 +246,33 @@ const wireConnection = () => {
       renderOmnibox();
       applyActiveView();
     }
+  });
+
+  connection.addEventListener('light', (event) => {
+    const { tabId, page } = event.detail || {};
+    if (!tabId || !page) return;
+    lightPages.set(tabId, page);
+    if (state.activeId === tabId) showLight(state.tabs.get(tabId), page, state.tabs.get(tabId)?.light);
+  });
+
+  connection.addEventListener('light:state', (event) => {
+    const detail = event.detail || {};
+    if (!detail.tabId || state.activeId !== detail.tabId) return;
+    const tab = state.tabs.get(detail.tabId);
+    if (!tab) return;
+    if (detail.loading) showLight(tab, null, { loading: true });
+    else if (detail.error) {
+      lightPages.delete(detail.tabId);
+      showLight(tab, null, { error: detail.error });
+    }
+  });
+
+  connection.addEventListener('engine', (event) => {
+    const detail = event.detail || {};
+    if (detail.tab) upsertTab(detail.tab);
+    if (detail.engine !== 'light') lightPages.delete(detail.tabId);
+    renderAll();
+    applyActiveView();
   });
 
   connection.addEventListener('tab:active', (event) => {
@@ -846,15 +917,25 @@ const resumeTab = (id) => {
 const applyActiveView = () => {
   const tab = activeTab();
   const showHome = !tab || (!tab.url && !tab.pendingNavigation);
+  const light = Boolean(tab && tab.engine === 'light' && !showHome);
   els.app.classList.toggle('is-newtab', showHome);
+  els.app.classList.toggle('is-light', light);
 
   if (showHome) {
+    hideLight();
     setActiveTab(null);
     hideOverlay();
     refreshHome();
     updatePlaceholder();
     if (document.activeElement === document.body) focusHomeSearch();
+  } else if (light) {
+    // The light engine paints its own DOM: this tab has no canvas, no frames and
+    // no server browser at all.
+    setActiveTab(tab);
+    hideOverlay();
+    showLight(tab, lightPages.get(tab.id) || null, tab.light);
   } else {
+    hideLight();
     setActiveTab(tab);
     if (tab.status === 'error' && tab.error) {
       showError(tab.error, { actionLabel: 'Reload', action: reload });
@@ -901,7 +982,22 @@ const renderToolbar = () => {
   const loading = Boolean(tab?.loading);
   els.progress.classList.toggle('is-active', loading);
   els.progress.classList.toggle('is-done', Boolean(tab) && !loading);
+  renderEngineButton();
   renderLatency();
+};
+
+const renderEngineButton = () => {
+  if (!els.engineBtn) return;
+  const tab = activeTab();
+  const engine = tab?.engine === 'light' ? 'light' : 'chromium';
+  els.engineBtn.dataset.engine = engine;
+  els.engineBtn.textContent = engine === 'light' ? 'Light' : 'Full';
+  els.engineBtn.disabled = !tab?.url;
+  els.engineBtn.title =
+    engine === 'light'
+      ? 'Lightweight engine, no server browser — switch this tab to the full browser'
+      : 'Full browser engine — switch this tab to lightweight mode';
+  els.engineBtn.setAttribute('aria-label', els.engineBtn.title);
 };
 
 const renderOmnibox = () => {
