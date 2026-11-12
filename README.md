@@ -254,6 +254,7 @@ benchmark report and its methodology live in [`docs/benchmarks.md`](docs/benchma
 | `ALLOW_NO_AUTH` | `0` | Explicit opt-in for an unauthenticated proxy; refused on public interfaces. |
 | `MAX_TABS` / `MAX_SESSIONS` | `12` / `40` | Per user / global live Chromium contexts. |
 | `TAB_IDLE_MINUTES` | `10` | Idle tabs are suspended (state saved, context closed). |
+| `TAB_SUSPEND_SECONDS` | `600` | A tab nobody is watching is suspended after this long, which returns its renderer memory; its URL, title and cookies are kept and the page reopens on the next activation. `0` disables the sweep. |
 | `BROWSER_IDLE_SECONDS` | `180` | A session with no connected visitor loses its Chromium process, audio sink and capture after this long; tabs reload on reconnect. |
 | `MAX_LIVE_BROWSERS` | `6` | Cap on concurrent Chromium processes. Only sessions with no connected visitor are evicted, least recently active first. |
 | `MAX_LIVE_TABS` | `16` | Cap on live pages across all sessions; the least recently used tab without viewers is suspended. |
@@ -577,7 +578,10 @@ should be exercised on a throwaway VPS before production.
   processes and pages exist at once, `BROWSER_IDLE_SECONDS` frees a disconnected session's browser,
   `SCREENCAST_FPS` limits frame encoding — frames above the cap are skipped in the compositor, so
   they are never encoded at all — and unwatched tabs are polled every `IDLE_POLL_MS` instead of
-  every 1.1 s. Favicon refreshes are throttled to once per host per minute.
+  every 1.1 s. Favicon refreshes are throttled to once per host per minute. Background tabs are
+  suspended after `TAB_SUSPEND_SECONDS` (default 10 minutes) because each one holds a live renderer
+  even though the viewer can only watch one tab at a time; the tab itself is kept and reopens on
+  activation.
 - Frames are packed into one preallocated buffer with a reusable header: 18.6 µs per 60 KB frame
   against 24.0 µs for the old `Buffer.concat` path, and one allocation instead of two
   (measured locally with the same frame payload).

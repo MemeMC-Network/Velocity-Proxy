@@ -180,17 +180,35 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   height: 46px;
   padding: 8px 12px 0;
 }
 
+/* The strip owns everything the buttons on either side leave over, so it can
+   never push the new-tab button out of the bar. Tabs shrink down to a readable
+   stub first and only then start scrolling. */
 .tabstrip-scroll {
   min-width: 0;
-  flex: 0 1 auto;
+  flex: 1 1 0;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
-  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 14px), transparent);
+  scroll-padding-inline: 10px;
+  overscroll-behavior-x: contain;
+  transition: mask-image 0.16s ease;
+}
+
+.tabstrip-scroll.fade-right {
+  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 20px), transparent);
+}
+
+.tabstrip-scroll.fade-left {
+  mask-image: linear-gradient(90deg, transparent 0, #000 20px);
+}
+
+.tabstrip-scroll.fade-left.fade-right {
+  mask-image: linear-gradient(90deg, transparent 0, #000 20px, #000 calc(100% - 20px), transparent);
 }
 
 .tabstrip-scroll::-webkit-scrollbar {
@@ -209,9 +227,9 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1 1 208px;
-  min-width: 108px;
-  max-width: 236px;
+  flex: 1 1 176px;
+  min-width: 64px;
+  max-width: 224px;
   height: 36px;
   padding: 0 6px 0 11px;
   border-radius: 10px 10px 0 0;
@@ -233,10 +251,14 @@ button:disabled {
 }
 
 .tab.is-active {
-  background: var(--surface-2);
-  border-color: var(--line);
+  background: linear-gradient(180deg, var(--surface-3), var(--surface-2) 72%);
+  border-color: var(--line-strong);
   color: var(--text);
   box-shadow: var(--hairline);
+}
+
+.tab.is-active .tab-close {
+  opacity: 0.72;
 }
 
 .tab.is-active::after {
@@ -333,25 +355,82 @@ button:disabled {
   animation-delay: 0.28s;
 }
 
+/* Bordered so the control is findable even when the strip is empty. */
 .newtab-btn {
   display: grid;
   place-items: center;
   width: 30px;
   height: 30px;
   flex: none;
-  border-radius: 8px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
+}
+
+.newtab-btn:hover {
+  background: var(--surface-3);
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.newtab-btn:active {
+  transform: translateY(1px);
+}
+
+/* Appears only once the tabs really no longer fit; the badge counts the ones
+   that are scrolled out of view. */
+.tab-overflow {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 9px;
   color: var(--text-dim);
   transition: background 0.14s ease, color 0.14s ease;
 }
 
-.newtab-btn:hover {
+.tab-overflow[hidden] {
+  display: none;
+}
+
+.tab-overflow:hover {
   background: var(--surface-2);
   color: var(--text);
 }
 
+.tab-overflow-icon {
+  display: grid;
+  place-items: center;
+}
+
+.tab-overflow-count {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  line-height: 13px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.tab-overflow-count[hidden] {
+  display: none;
+}
+
 .tabbar-spacer {
-  flex: 1 1 auto;
-  min-width: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .window-actions {
@@ -2237,11 +2316,18 @@ kbd {
   }
 
   .tab {
-    flex-basis: 148px;
-    min-width: 90px;
+    flex-basis: 132px;
+    min-width: 58px;
+    max-width: 168px;
     height: 34px;
     gap: 6px;
     padding-left: 8px;
+  }
+
+  .newtab-btn,
+  .tab-overflow {
+    width: 28px;
+    height: 28px;
   }
 
   .toolbar {

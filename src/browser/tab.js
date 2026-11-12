@@ -101,6 +101,10 @@ export class TabSession extends EventEmitter {
     this.mouseBusy = false;
     this.navSeq = 0;
     this.lastActivity = Date.now();
+    // When a viewer last watched this tab. `lastActivity` is bumped by polling
+    // and by the page itself, so it cannot answer "has anyone looked at this tab
+    // recently", which is the question the background-tab sweep asks.
+    this.lastViewerAt = Date.now();
     this.lastRecorded = { url: null, title: null, at: 0 };
     this.lastCursor = '';
     this.lastCursorAt = 0;
@@ -516,6 +520,7 @@ export class TabSession extends EventEmitter {
   attach(client) {
     this.clients.add(client);
     this.lastActivity = Date.now();
+    this.lastViewerAt = Date.now();
     this.emitState();
     this.resumeMedia().catch(() => {});
     this.startStreaming().catch(() => {});
@@ -526,6 +531,7 @@ export class TabSession extends EventEmitter {
   detach(client) {
     this.clients.delete(client);
     if (!this.hasViewers()) {
+      this.lastViewerAt = Date.now();
       this.stopStreaming().catch(() => {});
       // Nobody is listening to this tab's audio (background tabs are muted), so
       // keep it from decoding video for an empty room.
@@ -565,12 +571,24 @@ export class TabSession extends EventEmitter {
     clearTimeout(this.frameWatchdog);
     if (this.closed) return;
     const stallMs = this.frameRecoveries >= 2 ? 30_000 : 12_000;
-    this.frameWatchdog = setTimeout(() => {
+    this.frameWatchdog = setTimeout(async () => {
       this.frameWatchdog = null;
       if (this.closed || !this.streaming) return;
       if (Date.now() - this.lastFrameAt < stallMs) {
         this.armFrameWatchdog();
         return;
+      }
+      // A page with no animation paints once and then correctly sends nothing.
+      // Restarting the screencast on that was re-encoding a frame every 12 s on
+      // every static tab, so ask the compositor for one frame first: only a
+      // failed probe means capture is actually stuck.
+      if (this.deliveredFrames > 0) {
+        const probe = await this.captureScreenshot(55).catch(() => null);
+        if (probe) {
+          this.lastFrameAt = Date.now();
+          this.armFrameWatchdog();
+          return;
+        }
       }
       this.frameRecoveries += 1;
       // A capture that keeps stalling is usually the encoder rather than the

@@ -14,6 +14,7 @@
     "smoke": "node scripts/smoke-test.mjs",
     "test:light": "node scripts/light-test.mjs",
     "bench": "node scripts/benchmark.mjs",
+    "profile:memory": "node scripts/memory-profile.mjs",
     "browser:install": "playwright install chromium"
   },
   "dependencies": {

@@ -85,8 +85,14 @@ export const config = Object.freeze({
   // Nothing is watching a closed tab's browser, so free it much sooner than a
   // tab's page: this is where most of the RAM goes.
   browserIdleMs: integer(process.env.BROWSER_IDLE_SECONDS, 180, 15, 3600) * 1000,
+  // A background tab still holds a renderer (~60 MB each here). Suspending it
+  // keeps the tab, its URL and its cookies, and reopens the page on the next
+  // activation, so this is the one lever that returns memory per tab rather
+  // than just freeing idle browsers. 0 disables the sweep.
+  tabSuspendMs: integer(process.env.TAB_SUSPEND_SECONDS, 600, 0, 86400) * 1000,
   // Concurrent Chromium processes are capped; only idle sessions are evicted.
   maxLiveBrowsers: integer(process.env.MAX_LIVE_BROWSERS, Math.max(2, Math.min(6, sessionLimit)), 1, 32),
+  // Hard cap on simultaneously open pages, which is what bounds peak memory.
   maxLiveTabs: integer(
     process.env.MAX_LIVE_TABS,
     Math.max(4, Math.min(16, sessionLimit)),

@@ -594,6 +594,23 @@ export class WorkspaceManager {
     try {
       const now = Date.now();
       for (const [key, workspace] of this.workspaces) {
+        // A background tab keeps a whole renderer alive (measured ~60 MB here),
+        // and a connected viewer only ever streams the tab they are looking at.
+        // This runs before the "nobody is connected" exit below so it applies to
+        // signed-in viewers too; the tab, its URL and its cookies survive, and
+        // the page reopens on the next activation.
+        if (this.config.tabSuspendMs > 0) {
+          for (const record of workspace.records.values()) {
+            const session = record.session;
+            if (!session || !session.isLive()) continue;
+            if (record.id === workspace.activeRecordId) continue;
+            if (session.hasViewers()) continue;
+            const idleFor = now - (session.lastViewerAt || now);
+            if (idleFor < this.config.tabSuspendMs) continue;
+            log.debug('suspending background tab', record.id, `idle ${Math.round(idleFor / 1000)}s`);
+            await workspace.suspend(record).catch(() => {});
+          }
+        }
         if (workspace.clients.size > 0) continue;
         if (now - workspace.lastActiveAt > this.config.tabIdleMs) {
           for (const record of workspace.records.values()) {

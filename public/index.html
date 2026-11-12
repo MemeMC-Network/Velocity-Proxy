@@ -24,10 +24,14 @@
       <header class="chrome" id="chrome">
         <div class="tabbar">
           <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
-          <div class="tabstrip-scroll">
+          <div class="tabstrip-scroll" id="tabstrip-scroll">
             <div class="tabstrip" id="tabs" role="tablist" aria-label="Open tabs"></div>
           </div>
           <button class="newtab-btn" id="new-tab" type="button" aria-label="New tab" title="New tab (Ctrl+T)"></button>
+          <button class="tab-overflow" id="tab-overflow" type="button" aria-label="All tabs" title="All tabs" hidden>
+            <span class="tab-overflow-icon" id="tab-overflow-icon"></span>
+            <span class="tab-overflow-count" id="tab-overflow-count" hidden></span>
+          </button>
           <button class="icon-btn ghost tab-search" id="tab-search-btn" type="button" aria-label="Search tabs" title="Search tabs (Ctrl+Shift+A)"></button>
           <div class="tabbar-spacer"></div>
           <div class="window-actions">

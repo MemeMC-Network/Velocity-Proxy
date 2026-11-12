@@ -161,10 +161,9 @@ body.panel-open .audio-notice { display: none; }
 }
 
 .tab {
-  flex-basis: 190px;
-  max-width: 222px;
-  min-width: 104px;
-  height: 34px;
+  /* Sizing deliberately lives in app.css: a plain rule here would override the
+     narrow-screen rule there and pin every tab to 104px, which is what pushed
+     the last tab off the strip. */
   border-radius: 9px;
   border: 1px solid transparent;
   border-bottom: 0;
@@ -177,8 +176,8 @@ body.panel-open .audio-notice { display: none; }
 }
 
 .tab.is-active {
-  background: var(--surface-2);
-  border-color: var(--line);
+  background: linear-gradient(180deg, var(--surface-3), var(--surface-2) 72%);
+  border-color: var(--line-strong);
   box-shadow: var(--hairline), 0 6px 14px -12px rgba(0, 0, 0, 0.8);
 }
 

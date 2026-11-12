@@ -97,6 +97,7 @@ const cacheElements = () => {
     'shortcuts-modal', 'shortcuts-close',
     'omni-clear', 'omni-send', 'omni-spinner', 'tab-search-btn', 'bookmarks-btn', 'history-btn',
     'engine-btn', 'light-view', 'light-shell',
+    'tabstrip-scroll', 'tab-overflow', 'tab-overflow-count', 'tab-overflow-icon',
   ];
   for (const id of ids) {
     els[id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = document.getElementById(id);
@@ -230,6 +231,7 @@ const wireConnection = () => {
     renderAll();
     applyActiveView();
     updateConnectionStatus('open');
+    syncStripOverflow();
     startPings();
   });
 
@@ -474,6 +476,14 @@ const renderTabs = () => {
     }
     previous = node;
   }
+
+  requestAnimationFrame(() => {
+    syncStripOverflow();
+    revealActiveTab();
+    // Flex widths and font metrics can settle a frame after the nodes land, so
+    // one cheap follow-up keeps the overflow affordance honest on first paint.
+    setTimeout(syncStripOverflow, 150);
+  });
 };
 
 const tabNodeFor = (tab) => {
@@ -821,6 +831,89 @@ const openTabMenu = (id, x, y) => {
   menu.open(x, y, items);
 };
 
+/* ----------------------------------------------------------------- tab strip */
+
+const stripScroll = () =>
+  els.tabstripScroll || document.getElementById('tabstrip-scroll') || document.querySelector('.tabstrip-scroll');
+
+/**
+ * The strip is the only flexible thing in the bar, so it absorbs whatever the
+ * buttons leave behind. Once the tabs cannot shrink any further it scrolls
+ * instead, and this tells the user that: faded edges plus a chevron that
+ * counts how many tabs are out of view.
+ */
+const syncStripOverflow = () => {
+  const scroll = stripScroll();
+  if (!scroll) return;
+  const max = scroll.scrollWidth - scroll.clientWidth;
+  const overflowing = max > 2;
+  scroll.classList.toggle('fade-left', overflowing && scroll.scrollLeft > 2);
+  scroll.classList.toggle('fade-right', overflowing && scroll.scrollLeft < max - 2);
+  if (!els.tabOverflow) return;
+  els.tabOverflow.hidden = !overflowing;
+  if (!overflowing) {
+    if (els.tabOverflowCount) els.tabOverflowCount.hidden = true;
+    return;
+  }
+  const view = scroll.getBoundingClientRect();
+  let outOfView = 0;
+  for (const node of tabNodes.values()) {
+    if (!node.isConnected) continue;
+    const rect = node.getBoundingClientRect();
+    if (rect.left < view.left - 1 || rect.right > view.right + 1) outOfView += 1;
+  }
+  if (els.tabOverflowCount) {
+    els.tabOverflowCount.textContent = String(outOfView);
+    els.tabOverflowCount.hidden = outOfView === 0;
+  }
+  const total = scroll.querySelectorAll('.tab').length;
+  els.tabOverflow.title = `${outOfView} of ${total} tabs out of view — show all tabs`;
+};
+
+/** Keeps the selected tab on screen when it is activated from elsewhere. */
+const revealActiveTab = () => {
+  const scroll = stripScroll();
+  const node = state.activeId ? tabNodes.get(state.activeId) : null;
+  if (!scroll || !node || !node.isConnected) return;
+  const view = scroll.getBoundingClientRect();
+  const rect = node.getBoundingClientRect();
+  if (rect.left < view.left) scroll.scrollLeft -= view.left - rect.left + 14;
+  else if (rect.right > view.right) scroll.scrollLeft += rect.right - view.right + 14;
+};
+
+/** Every open tab in one list, then the ones that were just closed. */
+const openAllTabsMenu = () => {
+  const anchor = els.tabOverflow?.getBoundingClientRect();
+  const items = orderedTabs().map((tab, index) => ({
+    label: `${index + 1}. ${tabDisplayTitle(tab, tab.url ? prettyHost(tab.host) : 'New Tab')}`.slice(0, 64),
+    icon: tab.id === state.activeId ? 'check' : tab.pinned ? 'pin' : 'globe',
+    onSelect: () => activateTab(tab.id),
+  }));
+  if (closedTabs.length) {
+    items.push({ separator: true });
+    for (const entry of closedTabs.slice(-4).reverse()) {
+      items.push({
+        label: `Reopen · ${entry.title || entry.url}`.slice(0, 64),
+        icon: 'clock',
+        onSelect: () => newTabWithUrl(entry.url),
+      });
+    }
+  }
+  if (items.length) {
+    items.push({
+      label: `Copy all ${orderedTabs().length} tab links`,
+      icon: 'link',
+      onSelect: () => copyText(orderedTabs().map((tab) => tab.url).filter(Boolean).join('\n'), 'Tab links copied'),
+    });
+  }
+  items.push(
+    { separator: true },
+    { label: 'Search tabs…', icon: 'search', hint: 'Ctrl+Shift+A', onSelect: () => openTabSearch() },
+    { label: 'Reopen closed tab', icon: 'clock', hint: 'Ctrl+Shift+T', onSelect: () => reopenClosed() },
+  );
+  menu.open(anchor ? anchor.left - 120 : 12, anchor ? anchor.bottom + 6 : 52, items);
+};
+
 const newTabWithUrl = (url) => {
   if (!connection.isOpen) {
     toast('Still reconnecting to the proxy…', { tone: 'warn' });
@@ -1157,6 +1250,33 @@ const wireChrome = () => {
   els.bookmarksBtn?.addEventListener('click', () => openBookmarks());
   els.historyBtn?.addEventListener('click', () => openHistory());
   els.tabSearchBtn?.addEventListener('click', () => openTabSearch());
+  els.tabOverflow?.addEventListener('click', () => openAllTabsMenu());
+  els.tabstripScroll?.addEventListener('scroll', syncStripOverflow, { passive: true });
+  els.tabstripScroll?.addEventListener(
+    'wheel',
+    (event) => {
+      const strip = els.tabstripScroll;
+      if (!strip || Math.abs(event.deltaY) < Math.abs(event.deltaX)) return;
+      if (strip.scrollWidth <= strip.clientWidth) return;
+      strip.scrollLeft += event.deltaY;
+      event.preventDefault();
+    },
+    { passive: false },
+  );
+  // Middle-clicking the empty part of the strip opens a tab, like a browser.
+  els.tabs?.addEventListener('auxclick', (event) => {
+    if (event.button !== 1 || event.target?.closest?.('.tab, .tab-group')) return;
+    event.preventDefault();
+    newTab();
+  });
+  window.addEventListener('resize', syncStripOverflow);
+  // Tab widths settle a frame after the nodes are inserted, so watch the strip
+  // itself instead of trusting a single measurement.
+  if (typeof ResizeObserver === 'function' && els.tabstripScroll) {
+    const stripObserver = new ResizeObserver(() => syncStripOverflow());
+    stripObserver.observe(els.tabstripScroll);
+    if (els.tabs) stripObserver.observe(els.tabs);
+  }
   els.findClose?.addEventListener('click', () => closeFind());
   els.findPrev?.addEventListener('click', () => stepFind(false));
   els.findNext?.addEventListener('click', () => stepFind(true));
@@ -1185,6 +1305,7 @@ const wireChrome = () => {
   els.reload.innerHTML = icon('reload', 18);
   els.home.innerHTML = icon('home', 18);
   els.newTab.innerHTML = icon('plus', 17);
+  if (els.tabOverflowIcon) els.tabOverflowIcon.innerHTML = icon('chevronDown', 15);
   els.themeToggle.innerHTML = icon('sun', 18);
   els.settingsBtn.innerHTML = icon('settings', 18);
   els.bookmark.innerHTML = starIcon(false, 18);
@@ -1209,11 +1330,11 @@ const toggleBookmark = () => {
   refreshHome();
 };
 
-const copyText = async (text) => {
+const copyText = async (text, message = 'Destination URL copied') => {
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
-    toast('Destination URL copied', { tone: 'success' });
+    toast(message, { tone: 'success' });
   } catch {
     const helper = document.createElement('textarea');
     helper.value = text;
@@ -1223,7 +1344,7 @@ const copyText = async (text) => {
     helper.select();
     try {
       document.execCommand('copy');
-      toast('Destination URL copied', { tone: 'success' });
+      toast(message, { tone: 'success' });
     } catch {
       toast('Could not access the clipboard', { tone: 'warn' });
     }
