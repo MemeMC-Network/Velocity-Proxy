@@ -23,6 +23,7 @@ let frameSize = null;
 let contentRect = { x: 0, y: 0, width: 0, height: 0, scale: 1 };
 let pendingBitmap = null;
 let pendingCaptureTs = null;
+let pendingCached = null;
 // The last painted frame is kept alive so a canvas resize (window resize,
 // fullscreen, zoom, device-pixel-ratio change) can redraw it. Resizing clears
 // the canvas, and a static page emits no new frames - without this the viewer
@@ -34,6 +35,12 @@ let paintedRect = null;
 // stream carries server capture times, so this is what turns them into lag.
 // Null until the first pong: skew would otherwise look like lag.
 let clockOffset = null;
+// The last painted frame of each tab, kept as the JPEG that produced it. A tab
+// switch can then paint at once instead of waiting for the server's next frame,
+// which is what made switching feel like a reload. Encoded frames are a few
+// hundred KB each, so a handful of tabs costs less than one decoded screenshot.
+const frameCache = new Map();
+const FRAME_CACHE_LIMIT = 8;
 
 // Live renderer counters for the performance panel. Cheap increments only.
 const stats = {
@@ -183,12 +190,17 @@ export const setActiveTab = (tab) => {
     clearCanvas();
     hideOverlay();
     publishStreaming();
+    // Paint this tab's last frame straight away; the live stream replaces it a
+    // moment later, but the switch no longer flashes an empty canvas.
+    if (id) restoreCachedFrame(id).catch(() => {});
   }
   if (!tab || !tab.url) {
     hideOverlay();
     return;
   }
-  if (!hasFrame) showLoading(tab.title || 'Loading page…');
+  // A cached frame arrives without a round trip, so it needs no spinner - but a
+  // tab that is actually reloading still says so over its stale frame.
+  if (!hasFrame && (!frameCache.has(id) || tab.loading)) showLoading(tab.title || 'Loading page…');
 };
 
 export const clearViewport = () => {
@@ -199,6 +211,7 @@ export const clearViewport = () => {
     lastBitmap.close();
     lastBitmap = null;
   }
+  frameCache.clear();
   clearCanvas();
   hideOverlay();
   document.body.classList.remove('is-remote-fullscreen');
@@ -420,6 +433,26 @@ const repaintLastFrame = () => {
   paintedRect = { x, y, width, height };
 };
 
+/**
+ * Paints a tab's cached frame while its live stream reconnects. Resolves false
+ * when there is nothing cached (a tab that has never been watched).
+ */
+const restoreCachedFrame = async (id) => {
+  const cached = frameCache.get(id);
+  if (!cached || typeof createImageBitmap !== 'function') return false;
+  const blob = new Blob([cached.bytes], { type: 'image/jpeg' });
+  const bitmap = await createImageBitmap(blob).catch(() => null);
+  if (!bitmap) return false;
+  if (currentTabId !== id || !dom.ctx) {
+    bitmap.close();
+    return false;
+  }
+  if (cached.width && cached.height) frameSize = { width: cached.width, height: cached.height };
+  hasFrame = true;
+  schedulePaint(bitmap, null, cached);
+  return true;
+};
+
 const pump = async () => {
   decoding = true;
   while (pendingFrame) {
@@ -474,7 +507,7 @@ const drawFrame = async (buffer) => {
     bitmap.close();
     return;
   }
-  schedulePaint(bitmap, captureTs);
+  schedulePaint(bitmap, captureTs, { tabId, bytes: jpeg, width: frameSize?.width || 0, height: frameSize?.height || 0 });
 };
 
 /**
@@ -482,13 +515,14 @@ const drawFrame = async (buffer) => {
  * only the newest one is worth showing. The previous bitmap is released here so
  * a burst does not pile up GPU memory.
  */
-const schedulePaint = (bitmap, captureTs = null) => {
+const schedulePaint = (bitmap, captureTs = null, cached = null) => {
   if (pendingBitmap) {
     pendingBitmap.close();
     stats.dropped += 1;
   }
   pendingBitmap = bitmap;
   pendingCaptureTs = captureTs;
+  pendingCached = cached;
   if (paintScheduled) return;
   paintScheduled = true;
   requestAnimationFrame(paintPending);
@@ -498,8 +532,10 @@ const paintPending = () => {
   paintScheduled = false;
   const bitmap = pendingBitmap;
   const captureTs = pendingCaptureTs;
+  const cached = pendingCached;
   pendingBitmap = null;
   pendingCaptureTs = null;
+  pendingCached = null;
   if (!bitmap) return;
   if (!dom.ctx || !currentTabId) {
     bitmap.close();
@@ -524,6 +560,15 @@ const paintPending = () => {
   if (lastBitmap && lastBitmap !== bitmap) lastBitmap.close();
   lastBitmap = bitmap;
   hasFrame = true;
+  // Keep only what is on screen: an intermediate frame is not worth a slot.
+  if (cached && cached.tabId === currentTabId) {
+    frameCache.delete(cached.tabId);
+    frameCache.set(cached.tabId, cached);
+    while (frameCache.size > FRAME_CACHE_LIMIT) {
+      const oldest = frameCache.keys().next().value;
+      frameCache.delete(oldest);
+    }
+  }
   stats.painted += 1;
   stats.windowPainted += 1;
   // Capture-to-paint age: encoder time, network transit and decode together.

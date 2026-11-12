@@ -524,6 +524,7 @@ export class TabSession extends EventEmitter {
     this.emitState();
     this.resumeMedia().catch(() => {});
     this.startStreaming().catch(() => {});
+    this.primeFrame().catch(() => {});
     this.scheduleFaviconRefresh();
     this.poll().catch(() => {});
   }
@@ -641,6 +642,7 @@ export class TabSession extends EventEmitter {
     if (next) {
       this.resumeMedia().catch(() => {});
       await this.startStreaming();
+      this.primeFrame().catch(() => {});
     } else {
       await this.stopStreaming();
       // A hidden viewer gets no frames, so there is no reason for the page to
@@ -683,6 +685,24 @@ export class TabSession extends EventEmitter {
       .catch(() => {});
   }
 
+  /**
+   * Wraps one JPEG in the wire packet: magic, version, tab id, pixel size and
+   * the capture time, followed by the image itself.
+   */
+  framePacket(data, width, height, now = Date.now()) {
+    const frame = Buffer.isBuffer(data) ? data : Buffer.from(data, 'base64');
+    const header = this.frameHeader;
+    header.writeUInt16BE(clamp(Math.round(width), 1, 65535), 6);
+    header.writeUInt16BE(clamp(Math.round(height), 1, 65535), 8);
+    header.writeUInt32BE(now >>> 0, 10);
+    // One allocation and two copies per frame instead of Buffer.concat, which
+    // allocated twice and copied the JPEG twice at ~30 frames/second/tab.
+    const packet = Buffer.allocUnsafe(header.length + frame.length);
+    header.copy(packet, 0);
+    frame.copy(packet, header.length);
+    return packet;
+  }
+
   handleScreencastFrame(event) {
     if (!this.cdp || this.closed) return;
     this.cdp.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => {});
@@ -701,20 +721,12 @@ export class TabSession extends EventEmitter {
     if (now - this.lastFrameSentAt < minInterval) return;
     this.lastFrameSentAt = now;
 
-    const frame = Buffer.from(event.data, 'base64');
+    const jpeg = Buffer.from(event.data, 'base64');
     // Version 2 carries the frame's own pixel size, so the client can letterbox
     // instead of stretching whenever page size and viewport disagree.
     const width = clamp(Math.round(event.metadata?.deviceWidth || this.viewport.width), 1, 65535);
     const height = clamp(Math.round(event.metadata?.deviceHeight || this.viewport.height), 1, 65535);
-    const header = this.frameHeader;
-    header.writeUInt16BE(width, 6);
-    header.writeUInt16BE(height, 8);
-    header.writeUInt32BE(now >>> 0, 10);
-    // One allocation and two copies per frame instead of Buffer.concat, which
-    // allocated twice and copied the JPEG twice at ~30 frames/second/tab.
-    const packet = Buffer.allocUnsafe(header.length + frame.length);
-    header.copy(packet, 0);
-    frame.copy(packet, header.length);
+    const packet = this.framePacket(jpeg, width, height, now);
 
     for (const client of viewers) client.sendFrame(packet);
     this.lastActivity = Date.now();
@@ -734,7 +746,7 @@ export class TabSession extends EventEmitter {
     }
 
     this.fpsWindowFrames += 1;
-    this.fpsWindowBytes += frame.length;
+    this.fpsWindowBytes += jpeg.length;
     if (!this.fpsWindowStart) this.fpsWindowStart = now;
     else if (now - this.fpsWindowStart >= 1000) {
       const elapsed = now - this.fpsWindowStart;
@@ -745,7 +757,7 @@ export class TabSession extends EventEmitter {
       this.fpsWindowStart = now;
     }
 
-    this.frameSizeEma = this.frameSizeEma ? this.frameSizeEma * 0.9 + frame.length * 0.1 : frame.length;
+    this.frameSizeEma = this.frameSizeEma ? this.frameSizeEma * 0.9 + jpeg.length * 0.1 : jpeg.length;
     // Bandwidth is what a remote viewer actually feels: 30 frames of 100 KB is
     // 24 Mbps, which a small VPS uplink cannot carry, so frames queue and then
     // get dropped, which reads as laggy video. Keep the byte rate under the
@@ -791,6 +803,31 @@ export class TabSession extends EventEmitter {
         this.restartStreaming().catch(() => {});
       }
     }
+  }
+
+  /**
+   * Sends one immediate capture to the current viewers.
+   *
+   * A viewer that has just opened, switched to or resized a tab is looking at an
+   * empty canvas, and a screencast only paints when the page damages itself, so a
+   * static page leaves that canvas blank until something moves. One cheap encode
+   * per activation removes the wait and is not part of the per-frame path.
+   */
+  async primeFrame() {
+    if (this.closed || !this.cdp || !this.isLive() || !this.hasViewers()) return;
+    // A live frame is already on its way, and an older capture must not overwrite
+    // it: skip priming rather than race the screencast.
+    if (this.lastFrameSentAt && Date.now() - this.lastFrameSentAt < 250) return;
+    const data = await this.captureScreenshot(55).catch(() => null);
+    if (!data || this.closed || !this.cdp) return;
+    if (this.lastFrameSentAt && Date.now() - this.lastFrameSentAt < 250) return;
+    const viewers = this.viewers();
+    if (!viewers.length) return;
+    const packet = this.framePacket(data, this.viewport.width, this.viewport.height);
+    for (const client of viewers) client.sendFrame(packet);
+    // Counts as paint activity, so the stall watchdog does not restart a capture
+    // that is working.
+    this.lastFrameAt = Date.now();
   }
 
   setQuality(value) {

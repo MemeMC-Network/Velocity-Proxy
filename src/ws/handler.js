@@ -410,8 +410,10 @@ async function handle(client, workspace, message) {
 
     case 'stream:refresh': {
       // A resized viewer needs one fresh capture: a static page would otherwise
-      // never paint again after its canvas was cleared.
+      // never paint again after its canvas was cleared. Priming sends that frame
+      // straight away instead of waiting for the new screencast to paint.
       const { session } = await requireLive();
+      await session?.primeFrame();
       await session?.restartStreaming();
       return;
     }

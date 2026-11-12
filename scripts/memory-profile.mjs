@@ -36,6 +36,17 @@ const PORT = Number.parseInt(arg('port', '8096'), 10);
 // Time to let a policy act (idle sweeps, background-tab suspension) before the
 // post-policy measurement, so "after" is measured rather than assumed.
 const PAUSE_MS = Number.parseInt(arg('pause', '0'), 10);
+// Opens one real site instead of the local fixture, for measuring a page like a
+// video feed rather than a synthetic article.
+const TARGET_URL = arg('url', null);
+// Time to let the target settle (video buffering, lazy modules) before reading.
+const SETTLE_MS = Number.parseInt(arg('settle', '0'), 10);
+// Capture surface the page renders into. A video site picks its decode
+// resolution from this, so it is a memory lever, not just a layout choice.
+const VIEWPORT = (() => {
+  const [width, height] = String(arg('viewport', '1280x800')).split('x');
+  return { width: Number(width) || 1280, height: Number(height) || 800 };
+})();
 const dataDir = path.join(root, `.data-mem-${PORT}`);
 const origin = `http://127.0.0.1:${PORT}`;
 const PASSWORD = 'mem-pass';
@@ -258,15 +269,21 @@ const main = async () => {
     };
 
     // One tab first, so cold-launch cost is separated from per-tab cost.
+    const target = TARGET_URL || `${base}/article`;
+    const targetHost = TARGET_URL ? new URL(TARGET_URL).hostname.replace(/^www\./, '') : null;
     const openedAt = Date.now();
-    socket.send(JSON.stringify({ t: 'tab:create', input: `${base}/article`, viewport: { width: 1280, height: 800 } }));
+    socket.send(JSON.stringify({ t: 'tab:create', input: target, viewport: VIEWPORT }));
     await waitFor(
-      (message) => message.t === 'tab' && message.tab?.loading === false && (message.tab?.title || '') === 'Benchmark Article',
-      60000,
+      (message) =>
+        message.t === 'tab' &&
+        message.tab?.loading === false &&
+        (targetHost ? (message.tab?.url || '').includes(targetHost) : (message.tab?.title || '') === 'Benchmark Article'),
+      90000,
       'first tab',
     );
     report.firstTabMs = Date.now() - openedAt;
-    await sleep(2500);
+    report.target = target;
+    await sleep(SETTLE_MS > 0 ? SETTLE_MS : 2500);
     const one = summarise(await readProcesses());
     const oneStats = await stats();
     report.oneTab = {
@@ -276,9 +293,9 @@ const main = async () => {
       liveTabs: oneStats.resources.liveTabs,
     };
 
-    for (let index = 1; index < TAB_COUNT; index += 1) {
+    for (let index = 1; index < TAB_COUNT && !TARGET_URL; index += 1) {
       socket.send(
-        JSON.stringify({ t: 'tab:create', input: `${base}/article?n=${index}`, viewport: { width: 1280, height: 800 } }),
+        JSON.stringify({ t: 'tab:create', input: `${base}/article?n=${index}`, viewport: VIEWPORT }),
       );
       await waitFor(
         (message) => message.t === 'tab' && message.tab?.loading === false && (message.tab?.url || '').includes(`n=${index}`),
@@ -299,6 +316,7 @@ const main = async () => {
     const many = summarise(await readProcesses());
     const manyStats = await stats();
     const perTabPss = TAB_COUNT > 1 ? (many.pssMb - one.pssMb) / (TAB_COUNT - 1) : 0;
+    report.processRows = await readProcesses();
     report.allTabs = {
       chromium: many,
       serverRssMb: manyStats.process.rssMb,

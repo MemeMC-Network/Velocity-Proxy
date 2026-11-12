@@ -107,9 +107,12 @@ export const config = Object.freeze({
   frameQuality: integer(process.env.FRAME_QUALITY, 62, 20, 90),
   // What the stream is allowed to spend on the wire. Thirty 100 KB frames a
   // second is 24 Mbps, which saturates a small VPS uplink and arrives as bursts
-  // rather than smooth video. Quality drops first, then capture resolution, to
-  // stay under this.
-  streamMaxKbps: integer(process.env.STREAM_MAX_KBPS, 12000, 1000, 50000),
+  // rather than smooth video. Quality drops first, then frame rate, then capture
+  // resolution, to stay under this. 6000 kbps (750 KB/s) is the ceiling because
+  // every byte above it is another JPEG encode on a CPU that has none to spare: a
+  // playing video tab was measured at 795 KB/s, so the budget also bounds the
+  // encoder instead of letting one tab eat a whole core.
+  streamMaxKbps: integer(process.env.STREAM_MAX_KBPS, 6000, 1000, 50000),
   // Lightweight engine: the page is fetched server-side, reduced to readable
   // blocks and rendered by the viewer, so it costs no Chromium, no frame
   // encoding and no per-tab browser memory.
@@ -166,6 +169,11 @@ export const config = Object.freeze({
   // makes WebGL pages blank on a GPU-less server. This opts back in for headless
   // launches; it does not touch the sandbox.
   chromiumSoftwareGl: boolean(process.env.CHROMIUM_SOFTWARE_GL, true),
+  // A server has no GPU to use, so its GPU process exists only to run
+  // SwiftShader and cost memory. Measured on a playing TikTok tab, `off` took
+  // the browser from 992 MB to 744 MB (GPU process 187 MB -> 58 MB) at the same
+  // frame rate. `auto` restores Chromium's default for a machine with a GPU.
+  chromiumGpu: text(process.env.CHROMIUM_GPU, 'off').toLowerCase() === 'auto' ? 'auto' : 'off',
   userAgent: text(process.env.USER_AGENT),
 
   // CSP frame-ancestors. "*" allows embedding on any site; "'none'" (or "none")

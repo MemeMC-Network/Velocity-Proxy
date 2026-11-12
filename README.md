@@ -261,12 +261,13 @@ benchmark report and its methodology live in [`docs/benchmarks.md`](docs/benchma
 | `SCREENCAST_FPS` | `30` | Maximum frames pushed to viewers per second. Chromium skips the intermediate frames in the compositor, so they are never JPEG-encoded (at 30 fps this measured ~28% less browser CPU than encoding every frame), and the client drops anything still over the cap. |
 | `IDLE_POLL_MS` | `5000` | Page polling interval for tabs nobody is watching; `1100` while watched. |
 | `CHROMIUM_JS_HEAP_MB` | `512` | V8 old-space cap per renderer, so one heavy page cannot grow without bound. `0` keeps Chromium's default. |
+| `CHROMIUM_GPU` | `off` | A server has no GPU, so Chromium's GPU process only runs SwiftShader and costs memory. `off` disables it (measured 992 MB → 744 MB on a playing TikTok tab, same frame rate; WebGL still works through the SwiftShader opt-in). `auto` restores Chromium's default for a machine with a real GPU. |
 | `CHROMIUM_AUDIO_BUFFER` | `1024` | Frames in Chromium's own audio output buffer; lower means less audio delay relative to the video. Chromium clamps it to 512–8192. `0` keeps the default. |
 | `CHROMIUM_SOFTWARE_GL` | `1` | Headless only: passes `--enable-unsafe-swiftshader` so a GPU-less host can still create WebGL contexts (Chrome 139+ blocks the software fallback otherwise). Does not affect the sandbox. |
 | `CHROMIUM_SINGLE_PROCESS` | `0` | Adds `--single-process`. Off by default: Chromium does not support single-process browsing, and it disables site isolation and the renderer sandbox. |
 | `NAV_TIMEOUT_MS` | `45000` | Navigation timeout. |
 | `FRAME_QUALITY` | `62` | Initial JPEG quality (1–90), adapts to back-pressure. |
-| `STREAM_MAX_KBPS` | `12000` | Bandwidth budget for one tab's stream, averaged over a second. Above it JPEG quality falls to 40, then the frame rate to 20, then capture resolution to 70%. Thirty 100 KB frames a second is 24 Mbps, which saturates a small VPS uplink and arrives in bursts instead of smooth video. |
+| `STREAM_MAX_KBPS` | `6000` | Bandwidth budget for one tab's stream, averaged over a second. Above it JPEG quality falls to 40, then the frame rate to 20, then capture resolution to 70%. Thirty 100 KB frames a second is 24 Mbps, which saturates a small VPS uplink and arrives in bursts instead of smooth video. 6000 (750 KB/s) is the default because every byte above it is another JPEG encode on the same small CPU: a playing video tab measured 795 KB/s before the cap. |
 | `LIGHT_ENGINE` | `1` | Enable the lightweight engine and its routes. See [`docs/light-engine.md`](docs/light-engine.md). |
 | `LIGHT_MAX_BYTES` | `2000000` | Largest page body the light engine will read (enforced while streaming, not from `Content-Length`). |
 | `LIGHT_TIMEOUT_MS` | `15000` | Per-request timeout for light fetches, including redirects. |
